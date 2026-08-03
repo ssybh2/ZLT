@@ -429,7 +429,7 @@ class ManualDroneController(Node):
                 self.rc_data["left_switch"] = int(
                     self._read_field(message, self.rc_fields["left_switch"])
                 )
-                # Right switch is retained for diagnostics only; manual-only mode ignores it.
+                # Right switch controls ARM/DISARM; left switch remains available in rc_data.
                 self.rc_data["right_switch"] = int(
                     self._read_field(message, self.rc_fields["right_switch"])
                 )
@@ -497,17 +497,17 @@ class ManualDroneController(Node):
             return response
 
     def _update_arming_state(self) -> None:
-        switch = int(self.rc_data["left_switch"])
+        switch = int(self.rc_data["right_switch"])
         if switch == self.lock_switch_value:
             self.arm_permission = True
             if self.armed:
-                self._disarm("DJI left switch moved to LOCK")
+                self._disarm("DJI right switch moved to LOCK")
             return
 
         if switch not in self.unlock_switch_values or self.armed:
             return
         if self.require_lock_cycle_to_arm and not self.arm_permission:
-            self._throttled_warning("Cannot arm: move the DJI left switch to LOCK first")
+            self._throttled_warning("Cannot arm: move the DJI right switch to LOCK first")
             return
         if not self.imu_initialized:
             self._throttled_warning("Cannot arm: IMU has not initialized")
