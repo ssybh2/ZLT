@@ -170,7 +170,7 @@ class ManualDroneController(Node):
             "rc_left_switch_field": "left_switch",
             "rc_right_switch_field": "right_switch",
             "dshot_channel_fields": ["channel1", "channel2", "channel3", "channel4"],
-            "dry_run": True,
+            "dry_run": False,
             "control_frequency_hz": 1000.0,
             "data_timeout_s": 0.30,
             "require_low_throttle_to_arm": True,
