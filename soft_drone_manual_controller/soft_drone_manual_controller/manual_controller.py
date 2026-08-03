@@ -92,6 +92,41 @@ def apply_deadzone(value: float, deadzone: float) -> float:
     return 0.0 if abs(value) <= deadzone else float(value)
 
 
+def gravity_tilt_quat_frd(acceleration_frd: Sequence[float]) -> np.ndarray | None:
+    """Estimate Roll/Pitch from gravity in the source controller's FRD frame.
+
+    Coordinate convention copied from soft_drone_controller:
+        x: forward
+        y: right
+        z: down
+
+    sensor_msgs/Imu.linear_acceleration is treated as accelerometer specific
+    force. For a stationary level vehicle in FRD, it points approximately
+    along -z, so the signs below recover zero Roll and zero Pitch.
+
+    Gravity cannot determine Yaw; the returned quaternion therefore uses
+    yaw = 0.
+    """
+    accel = np.asarray(acceleration_frd, dtype=float)
+    if accel.shape != (3,) or not np.all(np.isfinite(accel)):
+        return None
+
+    norm = float(np.linalg.norm(accel))
+    if norm < 1.0e-6:
+        return None
+
+    ax, ay, az = accel / norm
+
+    # FRD specific-force tilt equations:
+    # level stationary vehicle -> [ax, ay, az] ~= [0, 0, -1]
+    roll = math.atan2(float(-ay), float(-az))
+    pitch = math.atan2(
+        float(ax),
+        math.sqrt(float(ay * ay + az * az)),
+    )
+    return euler_to_quat(roll, pitch, 0.0)
+
+
 @dataclass
 class RatePid:
     kp: float
@@ -451,13 +486,44 @@ class ManualDroneController(Node):
                 ],
                 dtype=float,
             )
+            # Copy the source repository convention exactly:
+            # quaternion [w, x, y, z] -> [w, x, -y, -z],
+            # converting the IMU FLU axes (x forward, y left, z up)
+            # to the controller FRD axes (x forward, y right, z down).
             q_abs = quat_normalize(q_raw * self.quaternion_signs)
             self.current_abs_quat = q_abs
 
             if self.initial_quat is None:
-                self.initial_quat = q_abs.copy()
+                accel_raw = np.array(
+                    [
+                        message.linear_acceleration.x,
+                        message.linear_acceleration.y,
+                        message.linear_acceleration.z,
+                    ],
+                    dtype=float,
+                )
+
+                # Copy the source repository vector convention exactly:
+                # [x, y, z] -> [x, -y, -z] (FLU -> FRD).
+                accel_frd = accel_raw * self.gyro_signs
+                q_gravity_tilt = gravity_tilt_quat_frd(accel_frd)
+                if q_gravity_tilt is None:
+                    return
+
+                # Keep the source repository's relative-quaternion order:
+                # q_relative = q_absolute * inverse(q_reference).
+                # Select q_reference so the first relative Roll/Pitch equals
+                # the gravity-derived tilt instead of being forced to zero.
+                # Yaw remains referenced to the first valid IMU quaternion,
+                # because gravity alone cannot observe Yaw.
+                self.initial_quat = quat_normalize(
+                    quat_multiply(quat_inverse(q_gravity_tilt), q_abs)
+                )
                 self.imu_initialized = True
-                self.get_logger().info("IMU attitude zero initialized from the first valid quaternion")
+                self.get_logger().info(
+                    "IMU initialized in source-controller FRD convention: "
+                    "Roll/Pitch from gravity, Yaw from first valid quaternion"
+                )
 
             # Preserve the relative-quaternion order used by the reference controller.
             self.relative_quat = quat_normalize(
