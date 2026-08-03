@@ -2,9 +2,9 @@
 # Keep dry_run=true until propellers are removed and every sign/channel is verified.
 soft_drone_manual_controller:
   ros__parameters:
-    rc_topic: /ecat/sn2228293/app1/read
-    imu_topic: /ecat/sn2228293/app2/read
-    dshot_topic: /ecat/sn2228293/app3/write
+    rc_topic: /ecat/sn2293823/app2/read
+    imu_topic: /ecat/sn2293823/app1/read
+    dshot_topic: /ecat/sn2293823/app3/write
     rc_message_type: custom_msgs/msg/ReadDJIRC
     dshot_message_type: custom_msgs/msg/WriteDSHOT
     rc_left_y_field: left_y
