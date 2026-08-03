@@ -1,0 +1,3 @@
+[submodule "src/EcatV2_Master"]
+	path = src/EcatV2_Master
+	url = https://github.com/AIMEtherCAT/EcatV2_Master.git
