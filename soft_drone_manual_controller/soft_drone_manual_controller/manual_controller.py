@@ -223,6 +223,10 @@ class ManualDroneController(Node):
             "max_roll_pitch_deg": 30.0,
             "stick_angle_multiplier": 1.0,
             "max_manual_yaw_rate_rad_s": 1.0,
+            # Trim values are the IMU Roll/Pitch readings when the motor plane
+            # is at the desired neutral balance attitude.
+            "roll_trim_deg": 0.0,
+            "pitch_trim_deg": 0.0,
             "quaternion_signs_wxyz": [1.0, 1.0, -1.0, -1.0],
             "gyro_signs_xyz": [1.0, -1.0, -1.0],
             "angle_gain": 0.50,
@@ -304,6 +308,8 @@ class ManualDroneController(Node):
         self.max_roll_pitch_rad = math.radians(float(self._p("max_roll_pitch_deg")))
         self.stick_angle_multiplier = float(self._p("stick_angle_multiplier"))
         self.max_manual_yaw_rate = float(self._p("max_manual_yaw_rate_rad_s"))
+        self.roll_trim_rad = math.radians(float(self._p("roll_trim_deg")))
+        self.pitch_trim_rad = math.radians(float(self._p("pitch_trim_deg")))
 
         self.quaternion_signs = np.asarray(self._p("quaternion_signs_wxyz"), dtype=float)
         self.gyro_signs = np.asarray(self._p("gyro_signs_xyz"), dtype=float)
@@ -632,8 +638,19 @@ class ManualDroneController(Node):
         throttle_raw = apply_deadzone(self.rc_data["left_y"], self.deadzone_throttle)
 
         target_limit = self.max_roll_pitch_rad * self.stick_angle_multiplier
-        roll_target = clamp(roll_raw, -1.0, 1.0) * target_limit
-        pitch_target = clamp(pitch_raw, -1.0, 1.0) * target_limit
+
+        # Neutral-stick targets include the user-defined mounting trim.
+        # Example: if the body is physically balanced while the IMU reports
+        # Roll=-5 deg, set roll_trim_deg=-5.0. The neutral target then becomes
+        # -5 deg, so the controller does not incorrectly force the body to 0 deg.
+        roll_target = (
+            self.roll_trim_rad
+            + clamp(roll_raw, -1.0, 1.0) * target_limit
+        )
+        pitch_target = (
+            self.pitch_trim_rad
+            + clamp(pitch_raw, -1.0, 1.0) * target_limit
+        )
         yaw_rate_target = clamp(yaw_raw, -1.0, 1.0) * self.max_manual_yaw_rate
 
         throttle_norm = (clamp(throttle_raw, -1.0, 1.0) + 1.0) / 2.0
