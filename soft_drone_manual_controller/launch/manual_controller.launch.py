@@ -20,7 +20,7 @@ def generate_launch_description():
             ),
             DeclareLaunchArgument(
                 "dry_run",
-                default_value="true",
+                default_value="false",
                 description="When true, calculate and publish diagnostics but do not publish DSHOT commands",
             ),
             Node(
