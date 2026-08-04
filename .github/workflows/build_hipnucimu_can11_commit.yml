@@ -47,15 +47,15 @@ jobs:
           cp hipnucimu-src/build/Release/hipnucimu.elf firmware/hipnucimu_can_0x11_0x12_0x13/hipnucimu_can_0x11_0x12_0x13.elf
           cp hipnucimu-src/build/Release/hipnucimu.bin firmware/hipnucimu_can_0x11_0x12_0x13/hipnucimu_can_0x11_0x12_0x13.bin
           cp hipnucimu-src/build/Release/hipnucimu.hex firmware/hipnucimu_can_0x11_0x12_0x13/hipnucimu_can_0x11_0x12_0x13.hex
-          cat > firmware/hipnucimu_can_0x11_0x12_0x13/README.txt <<'EOF'
-Target: STM32G431 CAN IMU module matching AIMEtherCAT/hipnucimu hardware
-CAN standard IDs: packet1=0x11, packet2=0x12, packet3=0x13
-CAN bitrate: 1 Mbit/s
-Use for the SECOND IMU only.
-H750 config app_4 must listen to 0x11, 0x12, 0x13.
-Do not flash into the H750 EtherCAT slave.
-Before flashing, back up the original firmware if possible and confirm ST-LINK detects STM32G431.
-EOF
+          printf '%s\n' \
+            'Target: STM32G431 CAN IMU module matching AIMEtherCAT/hipnucimu hardware' \
+            'CAN standard IDs: packet1=0x11, packet2=0x12, packet3=0x13' \
+            'CAN bitrate: 1 Mbit/s' \
+            'Use for the SECOND IMU only.' \
+            'H750 config app_4 must listen to 0x11, 0x12, 0x13.' \
+            'Do not flash into the H750 EtherCAT slave.' \
+            'Before flashing, back up the original firmware if possible and confirm ST-LINK detects STM32G431.' \
+            > firmware/hipnucimu_can_0x11_0x12_0x13/README.txt
           (cd firmware/hipnucimu_can_0x11_0x12_0x13 && sha256sum *.elf *.bin *.hex > SHA256SUMS.txt)
           arm-none-eabi-size firmware/hipnucimu_can_0x11_0x12_0x13/hipnucimu_can_0x11_0x12_0x13.elf
 
