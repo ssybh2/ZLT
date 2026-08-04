@@ -1,0 +1,81 @@
+name: Build and commit HIPNUC CAN 0x11-0x13 firmware
+
+on:
+  push:
+    branches:
+      - build-hipnucimu-can-11-13
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: build-hipnucimu-can-11-13
+
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build gcc-arm-none-eabi binutils-arm-none-eabi git
+
+      - name: Fetch upstream source
+        run: |
+          rm -rf hipnucimu-src
+          git clone --depth 1 https://github.com/AIMEtherCAT/hipnucimu.git hipnucimu-src
+
+      - name: Change CAN IDs
+        run: |
+          sed -i 's/#define PACKET1_CAN_ID 0x01/#define PACKET1_CAN_ID 0x11/' hipnucimu-src/Core/Src/main.c
+          sed -i 's/#define PACKET2_CAN_ID 0x02/#define PACKET2_CAN_ID 0x12/' hipnucimu-src/Core/Src/main.c
+          sed -i 's/#define PACKET3_CAN_ID 0x03/#define PACKET3_CAN_ID 0x13/' hipnucimu-src/Core/Src/main.c
+          grep -n 'PACKET[123]_CAN_ID' hipnucimu-src/Core/Src/main.c
+
+      - name: Configure and build
+        run: |
+          cmake -DCMAKE_BUILD_TYPE=Release -S hipnucimu-src -B hipnucimu-src/build/Release
+          cmake --build hipnucimu-src/build/Release --target hipnucimu.elf
+
+      - name: Prepare firmware files
+        run: |
+          mkdir -p firmware/hipnucimu_can_0x11_0x12_0x13
+          cp hipnucimu-src/build/Release/hipnucimu.elf firmware/hipnucimu_can_0x11_0x12_0x13/hipnucimu_can_0x11_0x12_0x13.elf
+          cp hipnucimu-src/build/Release/hipnucimu.bin firmware/hipnucimu_can_0x11_0x12_0x13/hipnucimu_can_0x11_0x12_0x13.bin
+          cp hipnucimu-src/build/Release/hipnucimu.hex firmware/hipnucimu_can_0x11_0x12_0x13/hipnucimu_can_0x11_0x12_0x13.hex
+          cat > firmware/hipnucimu_can_0x11_0x12_0x13/README.txt <<'EOF'
+Target: STM32G431 CAN IMU module matching AIMEtherCAT/hipnucimu hardware
+CAN standard IDs: packet1=0x11, packet2=0x12, packet3=0x13
+CAN bitrate: 1 Mbit/s
+Use for the SECOND IMU only.
+H750 config app_4 must listen to 0x11, 0x12, 0x13.
+Do not flash into the H750 EtherCAT slave.
+Before flashing, back up the original firmware if possible and confirm ST-LINK detects STM32G431.
+EOF
+          (cd firmware/hipnucimu_can_0x11_0x12_0x13 && sha256sum *.elf *.bin *.hex > SHA256SUMS.txt)
+          arm-none-eabi-size firmware/hipnucimu_can_0x11_0x12_0x13/hipnucimu_can_0x11_0x12_0x13.elf
+
+      - name: Commit generated firmware
+        run: |
+          rm -rf hipnucimu-src
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add firmware/hipnucimu_can_0x11_0x12_0x13
+          if git diff --cached --quiet; then
+            echo 'Firmware already up to date.'
+          else
+            git commit -m 'Build STM32G431 HIPNUC firmware with CAN IDs 0x11-0x13'
+            git push origin HEAD:build-hipnucimu-can-11-13
+          fi
+
+      - name: Upload downloadable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hipnucimu-can-0x11-0x13-firmware
+          path: firmware/hipnucimu_can_0x11_0x12_0x13/
+          if-no-files-found: error
+          retention-days: 30
