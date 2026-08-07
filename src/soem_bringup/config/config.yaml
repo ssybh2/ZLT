@@ -24,7 +24,7 @@ slaves:
             sdowrite_packet1_id: !uint32_t 0x04
             sdowrite_packet2_id: !uint32_t 0x05
             sdowrite_packet3_id: !uint32_t 0x06
-            conf_frame_name: !std::string 'imu2_link'
+            conf_frame_name: !std::string 'imu_link'
         - app_3:
             sdowrite_task_type: !uint8_t 1
             conf_connection_lost_read_action: !uint8_t 0x01
@@ -35,6 +35,6 @@ slaves:
             sdowrite_connection_lost_write_action: !uint8_t 0x01
             sub_topic: !std::string '/ecat/sn2883658/app4/write'
             pdowrite_offset: !uint16_t 0
-            sdowrite_dshot_id: !uint8_t 2
+            sdowrite_dshot_id: !uint8_t 1
             sdowrite_init_value: !uint16_t 0
 
