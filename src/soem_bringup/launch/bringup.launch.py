@@ -16,7 +16,7 @@ def generate_launch_description():
             executable='soem_backend',
             name='soem_backend',
             parameters=[{
-                'interface': "enp2s0",
+                'interface': "enp1s0",
                 'rt_cpu': 7,
                 'non_rt_cpus': "0,1,2,3,4,5,6",
                 'config_file': config_file

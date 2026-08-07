@@ -1,30 +1,40 @@
 slaves:
-  - sn2293823:
-      sdo_len: !uint16_t 21
-      task_count: !uint8_t 3
-      latency_pub_topic: !std::string '/ecat/sn2293823/latency'
+  - sn2883658:
+      sdo_len: !uint16_t 35
+      task_count: !uint8_t 4
+      latency_pub_topic: !std::string '/ecat/sn2883658/latency'
 
       tasks:
         - app_1:
-            sdowrite_task_type: !uint8_t 1
-            conf_connection_lost_read_action: !uint8_t 0x01
-            pub_topic: !std::string '/ecat/sn2293823/app1/read'
-            pdoread_offset: !uint16_t 0
-        - app_2:
-            sdowrite_task_type: !uint8_t 4
-            sdowrite_connection_lost_write_action: !uint8_t 0x01
-            sub_topic: !std::string '/ecat/sn2293823/app2/write'
-            pdowrite_offset: !uint16_t 0
-            sdowrite_dshot_id: !uint8_t 1
-            sdowrite_init_value: !uint16_t 0
-        - app_3:
             sdowrite_task_type: !uint8_t 3
             conf_connection_lost_read_action: !uint8_t 0x01
-            pub_topic: !std::string '/ecat/sn2293823/app3/read'
-            pdoread_offset: !uint16_t 19
+            pub_topic: !std::string '/ecat/sn2883658/app1/read'
+            pdoread_offset: !uint16_t 0
             sdowrite_can_inst: !uint8_t 1
-            sdowrite_packet1_id: !uint32_t 0x11
-            sdowrite_packet2_id: !uint32_t 0x12
-            sdowrite_packet3_id: !uint32_t 0x13
+            sdowrite_packet1_id: !uint32_t 0x01
+            sdowrite_packet2_id: !uint32_t 0x02
+            sdowrite_packet3_id: !uint32_t 0x03
+            conf_frame_name: !std::string 'imu_link'
+        - app_2:
+            sdowrite_task_type: !uint8_t 3
+            conf_connection_lost_read_action: !uint8_t 0x01
+            pub_topic: !std::string '/ecat/sn2883658/app2/read'
+            pdoread_offset: !uint16_t 21
+            sdowrite_can_inst: !uint8_t 1
+            sdowrite_packet1_id: !uint32_t 0x04
+            sdowrite_packet2_id: !uint32_t 0x05
+            sdowrite_packet3_id: !uint32_t 0x06
             conf_frame_name: !std::string 'imu2_link'
+        - app_3:
+            sdowrite_task_type: !uint8_t 1
+            conf_connection_lost_read_action: !uint8_t 0x01
+            pub_topic: !std::string '/ecat/sn2883658/app3/read'
+            pdoread_offset: !uint16_t 42
+        - app_4:
+            sdowrite_task_type: !uint8_t 4
+            sdowrite_connection_lost_write_action: !uint8_t 0x01
+            sub_topic: !std::string '/ecat/sn2883658/app4/write'
+            pdowrite_offset: !uint16_t 0
+            sdowrite_dshot_id: !uint8_t 2
+            sdowrite_init_value: !uint16_t 0
 
