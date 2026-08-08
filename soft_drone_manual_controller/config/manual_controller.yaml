@@ -1,9 +1,16 @@
 soft_drone_manual_controller:
   ros__parameters:
     # -------- EtherCAT topics and runtime-loaded interface types --------
-    rc_topic: /ecat/sn2293823/app2/read
-    imu_topic: /ecat/sn2293823/app1/read
-    dshot_topic: /ecat/sn2293823/app3/write
+    # Current ZLT EtherCAT mapping:
+    # app1/read = NEW IMU
+    # app2/read = ORIGINAL IMU (continues to be used by flight control)
+    # app3/read = DJI RC
+    # app4/write = DSHOT
+    rc_topic: /ecat/sn2883658/app3/read
+    imu_topic: /ecat/sn2883658/app2/read
+    secondary_imu_topic: /ecat/sn2883658/app1/read
+    dshot_topic: /ecat/sn2883658/app4/write
+
     rc_message_type: custom_msgs/msg/ReadDJIRC
     dshot_message_type: custom_msgs/msg/WriteDSHOT
 
@@ -38,15 +45,17 @@ soft_drone_manual_controller:
     # Safer extraction default. Original repository used 3.0 (up to 90 deg).
     stick_angle_multiplier: 1.0
     max_manual_yaw_rate_rad_s: 1.0
-    
-    #trim angle
+
     # -------- Neutral attitude trim --------
-    # Fill in the IMU readings when the motor plane is at the desired
-    # balanced attitude.
+    # Keep the existing primary/original IMU trim definition unchanged.
     roll_trim_deg: 0.0
     pitch_trim_deg: 0.0
 
-    # -------- IMU convention copied from the reference controller --------
+    # -------- IMU convention: EXISTING definition, DO NOT CHANGE --------
+    # Both IMUs are physically installed in the same direction.
+    # Raw IMU frame:       x forward, y left,  z up   (FLU)
+    # Controller/body:     x forward, y right, z down (FRD)
+    # Therefore BOTH IMUs use exactly the same existing conversion below.
     quaternion_signs_wxyz: [1.0, 1.0, -1.0, -1.0]
     gyro_signs_xyz: [1.0, -1.0, -1.0]
 
@@ -55,7 +64,7 @@ soft_drone_manual_controller:
     attitude_time_constant_s: 0.09
 
     # -------- Angular-rate inner loops --------
-    # Values include the multipliers used in the latest repository code.
+    # Unchanged. These loops continue to use ONLY the original/app2 IMU.
     roll_rate_kp: 0.1215
     roll_rate_ki: 0.0
     roll_rate_kd: 0.001
@@ -86,8 +95,7 @@ soft_drone_manual_controller:
     dshot_min: 48
     dshot_max: 2047
 
-    # Internal motor order -> outgoing channel order.
-    # Original: channel1=motor3, channel2=motor1, channel3=motor2, channel4=motor4.
+    # Keep your current runtime motor-channel mapping unchanged.
     dshot_channel_order: [1, 0, 2, 3]
 
     # -------- Diagnostics --------

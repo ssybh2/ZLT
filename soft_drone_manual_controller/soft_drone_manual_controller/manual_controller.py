@@ -1,9 +1,23 @@
 #!/usr/bin/env python3
 """Manual-only DJI RC quadrotor controller for ROS 2.
 
-The control path is extracted from ssybh2/soft_drone_controller:
+Control path (unchanged for the original/primary IMU):
 DJI sticks -> attitude/rate setpoints -> quaternion outer loop -> rate PID ->
 X-frame mixer -> DSHOT.
+
+Dual-IMU addition:
+- Primary/original IMU: /ecat/sn2883658/app2/read
+  Continues to be the ONLY IMU used by the flight-control loop and arming failsafe.
+- Secondary/new IMU: /ecat/sn2883658/app1/read
+  Observer/diagnostics only. It does not change attitude control, rate PID, mixer,
+  DSHOT, arming, or failsafe behavior.
+
+Both IMUs are mounted with the same physical orientation. Their raw sensor frame is
+FLU (x forward, y left, z up). The existing controller conversion is preserved
+exactly for BOTH IMUs:
+    quaternion [w, x, y, z] -> [w, x, -y, -z]
+    vectors    [x, y, z]    -> [x, -y, -z]
+which yields the controller/body FRD frame (x forward, y right, z down).
 """
 
 from __future__ import annotations
@@ -84,7 +98,7 @@ def euler_to_quat(roll: float, pitch: float, yaw: float) -> np.ndarray:
 
 
 def quaternion_error(q_command: Sequence[float], q_measured: Sequence[float]) -> np.ndarray:
-    """Return q_measured^-1 * q_command, matching the source controller."""
+    """Return q_measured^-1 * q_command, matching the existing controller."""
     return quat_multiply(quat_inverse(q_measured), q_command)
 
 
@@ -93,19 +107,16 @@ def apply_deadzone(value: float, deadzone: float) -> float:
 
 
 def gravity_tilt_quat_frd(acceleration_frd: Sequence[float]) -> np.ndarray | None:
-    """Estimate Roll/Pitch from gravity in the source controller's FRD frame.
+    """Estimate Roll/Pitch from gravity in the existing FRD body/controller frame.
 
-    Coordinate convention copied from soft_drone_controller:
+    Existing convention is preserved:
         x: forward
         y: right
         z: down
 
     sensor_msgs/Imu.linear_acceleration is treated as accelerometer specific
     force. For a stationary level vehicle in FRD, it points approximately
-    along -z, so the signs below recover zero Roll and zero Pitch.
-
-    Gravity cannot determine Yaw; the returned quaternion therefore uses
-    yaw = 0.
+    along -z. Gravity cannot determine yaw, so yaw is set to zero here.
     """
     accel = np.asarray(acceleration_frd, dtype=float)
     if accel.shape != (3,) or not np.all(np.isfinite(accel)):
@@ -116,14 +127,8 @@ def gravity_tilt_quat_frd(acceleration_frd: Sequence[float]) -> np.ndarray | Non
         return None
 
     ax, ay, az = accel / norm
-
-    # FRD specific-force tilt equations:
-    # level stationary vehicle -> [ax, ay, az] ~= [0, 0, -1]
     roll = math.atan2(float(-ay), float(-az))
-    pitch = math.atan2(
-        float(ax),
-        math.sqrt(float(ay * ay + az * az)),
-    )
+    pitch = math.atan2(float(ax), math.sqrt(float(ay * ay + az * az)))
     return euler_to_quat(roll, pitch, 0.0)
 
 
@@ -149,7 +154,6 @@ class RatePid:
         error = float(setpoint - measurement)
         if abs(error) < self.error_deadband:
             self.integral = 0.0
-            # Keep derivative state synchronized to avoid a spike when leaving the deadband.
             self.previous_measurement = float(measurement)
             self.initialized = True
             return 0.0
@@ -163,7 +167,6 @@ class RatePid:
         self.previous_measurement = float(measurement)
         self.initialized = True
 
-        # The source controller uses a negative derivative-on-measurement damping term.
         return float(self.kp * error + self.ki * self.integral - self.kd * measurement_rate)
 
 
@@ -183,6 +186,10 @@ class ManualDroneController(Node):
         self.get_logger().info(
             "Manual controller started: DJI RC -> quaternion attitude -> rate PID -> DSHOT"
         )
+        self.get_logger().info(
+            "Dual IMU: PRIMARY/old=%s (flight control), SECONDARY/new=%s (observer only)"
+            % (self.imu_topic, self.secondary_imu_topic)
+        )
         self.get_logger().warn(
             "DRY RUN is %s. Remove propellers before changing signs, mixer, or channel order."
             % ("ON" if self.dry_run else "OFF")
@@ -193,9 +200,12 @@ class ManualDroneController(Node):
     # ------------------------------------------------------------------
     def _declare_parameters(self) -> None:
         defaults: dict[str, Any] = {
-            "rc_topic": "/ecat/sn2293823/app2/read",
-            "imu_topic": "/ecat/sn2293823/app1/read",
-            "dshot_topic": "/ecat/sn2293823/app3/write",
+            # Current EtherCAT mapping in ZLT:
+            # app1 = new IMU, app2 = original IMU, app3 = DJI RC, app4 = DSHOT.
+            "rc_topic": "/ecat/sn2883658/app3/read",
+            "imu_topic": "/ecat/sn2883658/app2/read",
+            "secondary_imu_topic": "/ecat/sn2883658/app1/read",
+            "dshot_topic": "/ecat/sn2883658/app4/write",
             "rc_message_type": "custom_msgs/msg/ReadDJIRC",
             "dshot_message_type": "custom_msgs/msg/WriteDSHOT",
             "rc_left_y_field": "left_y",
@@ -223,10 +233,14 @@ class ManualDroneController(Node):
             "max_roll_pitch_deg": 30.0,
             "stick_angle_multiplier": 1.0,
             "max_manual_yaw_rate_rad_s": 1.0,
-            # Trim values are the IMU Roll/Pitch readings when the motor plane
-            # is at the desired neutral balance attitude.
+            # Existing trim behavior is unchanged.
             "roll_trim_deg": 0.0,
             "pitch_trim_deg": 0.0,
+            # IMPORTANT: preserve the existing FLU -> FRD conversion exactly.
+            # Raw IMU: x forward, y left, z up.
+            # Controller/body: x forward, y right, z down.
+            # The new IMU has the same installation direction, so it uses the
+            # exact same conversion; no extra mounting rotation is introduced.
             "quaternion_signs_wxyz": [1.0, 1.0, -1.0, -1.0],
             "gyro_signs_xyz": [1.0, -1.0, -1.0],
             "angle_gain": 0.50,
@@ -259,6 +273,8 @@ class ManualDroneController(Node):
             "pwm_max_us": 2000.0,
             "dshot_min": 48,
             "dshot_max": 2047,
+            # Keep the existing code default. YAML below keeps your current
+            # runtime mapping [1, 0, 2, 3].
             "dshot_channel_order": [2, 0, 1, 3],
             "diagnostics_prefix": "/manual_drone",
             "status_log_period_s": 0.50,
@@ -272,6 +288,7 @@ class ManualDroneController(Node):
     def _read_parameters(self) -> None:
         self.rc_topic = str(self._p("rc_topic"))
         self.imu_topic = str(self._p("imu_topic"))
+        self.secondary_imu_topic = str(self._p("secondary_imu_topic"))
         self.dshot_topic = str(self._p("dshot_topic"))
         self.rc_message_type_name = str(self._p("rc_message_type"))
         self.dshot_message_type_name = str(self._p("dshot_message_type"))
@@ -344,7 +361,7 @@ class ManualDroneController(Node):
     def _load_runtime_message_types(self) -> None:
         try:
             self.rc_msg_type = get_message(self.rc_message_type_name)
-        except Exception as exc:  # noqa: BLE001 - provide actionable ROS error
+        except Exception as exc:  # noqa: BLE001
             raise RuntimeError(
                 f"Cannot load RC type '{self.rc_message_type_name}'. "
                 "Build/source the interface package or change rc_message_type."
@@ -373,14 +390,45 @@ class ManualDroneController(Node):
         self.rc_sub = self.create_subscription(
             self.rc_msg_type, self.rc_topic, self._rc_callback, qos_best_effort
         )
-        self.imu_sub = self.create_subscription(Imu, self.imu_topic, self._imu_callback, qos_best_effort)
 
+        # Primary/original IMU. This remains the existing flight-control path.
+        self.imu_sub = self.create_subscription(
+            Imu, self.imu_topic, self._imu_callback, qos_best_effort
+        )
+
+        # Secondary/new IMU. Observer only; never used by control or arming.
+        self.secondary_imu_sub = self.create_subscription(
+            Imu,
+            self.secondary_imu_topic,
+            self._secondary_imu_callback,
+            qos_best_effort,
+        )
+
+        # Existing diagnostics: keep names and meaning unchanged (primary IMU).
         self.imu_angle_pub = self.create_publisher(
             Vector3, f"{self.diagnostics_prefix}/imu_angle_deg", qos_reliable
         )
         self.imu_gyro_pub = self.create_publisher(
             Vector3, f"{self.diagnostics_prefix}/imu_gyro_rad_s", qos_reliable
         )
+
+        # New observer diagnostics for the second IMU and the IMU pair.
+        self.secondary_imu_angle_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/secondary_imu_angle_deg", qos_reliable
+        )
+        self.secondary_imu_gyro_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/secondary_imu_gyro_rad_s", qos_reliable
+        )
+        self.imu_common_gyro_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/imu_common_gyro_rad_s", qos_reliable
+        )
+        self.imu_diff_gyro_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/imu_diff_gyro_rad_s", qos_reliable
+        )
+        self.imu_relative_angle_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/imu_relative_angle_deg", qos_reliable
+        )
+
         self.torque_pub = self.create_publisher(
             Vector3, f"{self.diagnostics_prefix}/torque_command", qos_reliable
         )
@@ -412,12 +460,34 @@ class ManualDroneController(Node):
         self.last_status_log_time = 0.0
         self.last_arm_block_log_time = 0.0
 
+        # ------------------------------------------------------------------
+        # Existing primary/original IMU state: names and control use unchanged.
+        # ------------------------------------------------------------------
         self.current_abs_quat: np.ndarray | None = None
         self.initial_quat: np.ndarray | None = None
         self.relative_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         self.relative_euler = np.zeros(3, dtype=float)
         self.gyro = np.zeros(3, dtype=float)
         self.imu_initialized = False
+
+        # ------------------------------------------------------------------
+        # New secondary IMU observer state. Same FLU -> FRD conversion.
+        # ------------------------------------------------------------------
+        self.secondary_current_abs_quat: np.ndarray | None = None
+        self.secondary_initial_quat: np.ndarray | None = None
+        self.secondary_relative_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        self.secondary_relative_euler = np.zeros(3, dtype=float)
+        self.secondary_gyro = np.zeros(3, dtype=float)
+        self.secondary_imu_initialized = False
+        self.last_secondary_imu_time = 0.0
+
+        # Pair observer outputs, all expressed in the existing FRD body frame.
+        self.imu_common_gyro = np.zeros(3, dtype=float)
+        self.imu_diff_gyro = np.zeros(3, dtype=float)
+        self.imu_pair_reference_quat: np.ndarray | None = None
+        self.imu_relative_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        self.imu_relative_euler = np.zeros(3, dtype=float)
+
         self.armed = False
         self.arm_permission = not self.require_lock_cycle_to_arm
         self.motor_pwm = np.full(4, self.pwm_min_us, dtype=float)
@@ -470,7 +540,6 @@ class ManualDroneController(Node):
                 self.rc_data["left_switch"] = int(
                     self._read_field(message, self.rc_fields["left_switch"])
                 )
-                # Right switch controls ARM/DISARM; left switch remains available in rc_data.
                 self.rc_data["right_switch"] = int(
                     self._read_field(message, self.rc_fields["right_switch"])
                 )
@@ -482,6 +551,12 @@ class ManualDroneController(Node):
             self._update_arming_state()
 
     def _imu_callback(self, message: Imu) -> None:
+        """Original/primary IMU callback.
+
+        This is intentionally kept as the flight-control IMU path. The existing
+        FLU -> FRD coordinate conversion and existing initialization convention
+        are preserved.
+        """
         with self._lock:
             q_raw = np.array(
                 [
@@ -492,10 +567,11 @@ class ManualDroneController(Node):
                 ],
                 dtype=float,
             )
-            # Copy the source repository convention exactly:
-            # quaternion [w, x, y, z] -> [w, x, -y, -z],
-            # converting the IMU FLU axes (x forward, y left, z up)
-            # to the controller FRD axes (x forward, y right, z down).
+
+            # EXISTING conversion, unchanged:
+            # [w, x, y, z] -> [w, x, -y, -z]
+            # IMU FLU (x forward, y left, z up)
+            # -> controller/body FRD (x forward, y right, z down).
             q_abs = quat_normalize(q_raw * self.quaternion_signs)
             self.current_abs_quat = q_abs
 
@@ -509,29 +585,23 @@ class ManualDroneController(Node):
                     dtype=float,
                 )
 
-                # Copy the source repository vector convention exactly:
-                # [x, y, z] -> [x, -y, -z] (FLU -> FRD).
+                # EXISTING conversion, unchanged: [x, y, z] -> [x, -y, -z].
                 accel_frd = accel_raw * self.gyro_signs
                 q_gravity_tilt = gravity_tilt_quat_frd(accel_frd)
                 if q_gravity_tilt is None:
                     return
 
-                # Keep the source repository's relative-quaternion order:
-                # q_relative = q_absolute * inverse(q_reference).
-                # Select q_reference so the first relative Roll/Pitch equals
-                # the gravity-derived tilt instead of being forced to zero.
-                # Yaw remains referenced to the first valid IMU quaternion,
-                # because gravity alone cannot observe Yaw.
+                # EXISTING relative-quaternion convention, unchanged.
                 self.initial_quat = quat_normalize(
                     quat_multiply(quat_inverse(q_gravity_tilt), q_abs)
                 )
                 self.imu_initialized = True
                 self.get_logger().info(
-                    "IMU initialized in source-controller FRD convention: "
+                    "Primary IMU initialized in existing FRD convention: "
                     "Roll/Pitch from gravity, Yaw from first valid quaternion"
                 )
 
-            # Preserve the relative-quaternion order used by the reference controller.
+            # EXISTING order, unchanged: q_relative = q_absolute * inverse(q_reference)
             self.relative_quat = quat_normalize(
                 quat_multiply(q_abs, quat_inverse(self.initial_quat))
             )
@@ -546,11 +616,136 @@ class ManualDroneController(Node):
                 ],
                 dtype=float,
             )
+
+            # EXISTING conversion, unchanged: [x, y, z] -> [x, -y, -z].
             self.gyro = gyro_raw * self.gyro_signs
             self.last_imu_time = self._now_seconds()
             self._publish_imu_diagnostics()
 
-    def _reset_zero_callback(self, _request: Trigger.Request, response: Trigger.Response) -> Trigger.Response:
+            # Observer update only. Does not feed anything back into control.
+            self._update_dual_imu_observer()
+
+    def _secondary_imu_callback(self, message: Imu) -> None:
+        """New IMU callback: observer only.
+
+        The new IMU is mounted exactly like the original IMU, so it uses the
+        SAME raw-FLU -> controller-FRD conversion. No additional rotation,
+        remapping, or coordinate-frame definition is introduced.
+        """
+        with self._lock:
+            q_raw = np.array(
+                [
+                    message.orientation.w,
+                    message.orientation.x,
+                    message.orientation.y,
+                    message.orientation.z,
+                ],
+                dtype=float,
+            )
+
+            # Same conversion as the original IMU: FLU -> FRD.
+            q_abs = quat_normalize(q_raw * self.quaternion_signs)
+            self.secondary_current_abs_quat = q_abs
+
+            if self.secondary_initial_quat is None:
+                accel_raw = np.array(
+                    [
+                        message.linear_acceleration.x,
+                        message.linear_acceleration.y,
+                        message.linear_acceleration.z,
+                    ],
+                    dtype=float,
+                )
+                accel_frd = accel_raw * self.gyro_signs
+                q_gravity_tilt = gravity_tilt_quat_frd(accel_frd)
+                if q_gravity_tilt is None:
+                    return
+
+                # Same initialization convention as the original IMU.
+                self.secondary_initial_quat = quat_normalize(
+                    quat_multiply(quat_inverse(q_gravity_tilt), q_abs)
+                )
+                self.secondary_imu_initialized = True
+                self.get_logger().info(
+                    "Secondary IMU initialized with the same existing FRD conversion "
+                    "(observer only)"
+                )
+
+            self.secondary_relative_quat = quat_normalize(
+                quat_multiply(q_abs, quat_inverse(self.secondary_initial_quat))
+            )
+            self.secondary_relative_euler = np.asarray(
+                quat_to_euler(self.secondary_relative_quat), dtype=float
+            )
+            self.secondary_relative_euler[2] = wrap_pi(
+                float(self.secondary_relative_euler[2])
+            )
+
+            gyro_raw = np.array(
+                [
+                    message.angular_velocity.x,
+                    message.angular_velocity.y,
+                    message.angular_velocity.z,
+                ],
+                dtype=float,
+            )
+            self.secondary_gyro = gyro_raw * self.gyro_signs
+            self.last_secondary_imu_time = self._now_seconds()
+
+            self._publish_secondary_imu_diagnostics()
+            self._update_dual_imu_observer()
+
+    def _update_dual_imu_observer(self) -> None:
+        """Compute observer-only quantities after both IMUs are valid.
+
+        All angular velocities are already expressed in the SAME existing FRD
+        body/controller axes before entering this function.
+
+        common = (primary + secondary) / 2
+        diff   = secondary - primary
+
+        The diff signal is deliberately the full physical difference, not half
+        the difference. For a perfectly anti-phase pair (+A and -A), diff=2A.
+        It is useful for later structural-vibration/PSD analysis but is NOT fed
+        into the flight controller in this version.
+        """
+        if not self.imu_initialized or not self.secondary_imu_initialized:
+            return
+        if self.current_abs_quat is None or self.secondary_current_abs_quat is None:
+            return
+
+        self.imu_common_gyro = 0.5 * (self.gyro + self.secondary_gyro)
+        self.imu_diff_gyro = self.secondary_gyro - self.gyro
+
+        # Relative orientation between the two IMU-bearing rods.
+        # Both q's have already undergone the SAME FLU -> FRD conversion.
+        pair_abs = quat_normalize(
+            quat_multiply(
+                self.secondary_current_abs_quat,
+                quat_inverse(self.current_abs_quat),
+            )
+        )
+
+        # Remove the fixed initial offset between the two IMUs. This affects
+        # only the new diagnostic topic; it does not touch either IMU's control
+        # coordinate definition or the primary flight-control zero.
+        if self.imu_pair_reference_quat is None:
+            self.imu_pair_reference_quat = pair_abs.copy()
+
+        self.imu_relative_quat = quat_normalize(
+            quat_multiply(pair_abs, quat_inverse(self.imu_pair_reference_quat))
+        )
+        self.imu_relative_euler = np.asarray(
+            quat_to_euler(self.imu_relative_quat), dtype=float
+        )
+        self.imu_relative_euler[2] = wrap_pi(float(self.imu_relative_euler[2]))
+
+        self._publish_dual_imu_diagnostics()
+
+    def _reset_zero_callback(
+        self, _request: Trigger.Request, response: Trigger.Response
+    ) -> Trigger.Response:
+        # Existing service behavior remains tied to the original/primary IMU.
         with self._lock:
             if self.armed:
                 response.success = False
@@ -565,7 +760,7 @@ class ManualDroneController(Node):
             self.relative_euler[:] = 0.0
             self._reset_controllers()
             response.success = True
-            response.message = "Attitude zero reset to the current IMU orientation"
+            response.message = "Attitude zero reset to the current primary IMU orientation"
             return response
 
     def _update_arming_state(self) -> None:
@@ -610,6 +805,8 @@ class ManualDroneController(Node):
             self.get_logger().warn(f"DISARMED: {reason}")
 
     def _check_data_validity(self, now: float) -> bool:
+        # Keep the existing safety behavior: RC + PRIMARY/original IMU only.
+        # A secondary-IMU timeout must NOT disarm the aircraft in this version.
         rc_ok = self.last_rc_time > 0.0 and (now - self.last_rc_time) <= self.data_timeout_s
         imu_ok = self.last_imu_time > 0.0 and (now - self.last_imu_time) <= self.data_timeout_s
         if rc_ok and imu_ok:
@@ -629,7 +826,7 @@ class ManualDroneController(Node):
         self.yaw_rate_pid.reset()
 
     # ------------------------------------------------------------------
-    # Manual flight control
+    # Manual flight control -- unchanged control structure
     # ------------------------------------------------------------------
     def _process_sticks(self) -> tuple[float, float, float, float]:
         roll_raw = apply_deadzone(self.rc_data["right_x"], self.deadzone_roll)
@@ -639,18 +836,8 @@ class ManualDroneController(Node):
 
         target_limit = self.max_roll_pitch_rad * self.stick_angle_multiplier
 
-        # Neutral-stick targets include the user-defined mounting trim.
-        # Example: if the body is physically balanced while the IMU reports
-        # Roll=-5 deg, set roll_trim_deg=-5.0. The neutral target then becomes
-        # -5 deg, so the controller does not incorrectly force the body to 0 deg.
-        roll_target = (
-            self.roll_trim_rad
-            + clamp(roll_raw, -1.0, 1.0) * target_limit
-        )
-        pitch_target = (
-            self.pitch_trim_rad
-            + clamp(pitch_raw, -1.0, 1.0) * target_limit
-        )
+        roll_target = self.roll_trim_rad + clamp(roll_raw, -1.0, 1.0) * target_limit
+        pitch_target = self.pitch_trim_rad + clamp(pitch_raw, -1.0, 1.0) * target_limit
         yaw_rate_target = clamp(yaw_raw, -1.0, 1.0) * self.max_manual_yaw_rate
 
         throttle_norm = (clamp(throttle_raw, -1.0, 1.0) + 1.0) / 2.0
@@ -664,6 +851,7 @@ class ManualDroneController(Node):
         yaw_rate_target: float,
         dt: float,
     ) -> np.ndarray:
+        # IMPORTANT: still uses ONLY the original/primary IMU values.
         roll_measured, pitch_measured, yaw_measured = self.relative_euler
         q_setpoint = euler_to_quat(roll_target, pitch_target, float(yaw_measured))
         q_measured = euler_to_quat(
@@ -683,6 +871,7 @@ class ManualDroneController(Node):
         roll_rate_target = float(rate_setpoint[0])
         pitch_rate_target = float(rate_setpoint[1])
 
+        # IMPORTANT: still uses ONLY self.gyro from the original/app2 IMU.
         torque_roll = self.roll_rate_pid.update(roll_rate_target, float(self.gyro[0]), dt)
         torque_pitch = self.pitch_rate_pid.update(pitch_rate_target, float(self.gyro[1]), dt)
         torque_yaw = self.yaw_rate_pid.update(yaw_rate_target, float(self.gyro[2]), dt)
@@ -731,7 +920,9 @@ class ManualDroneController(Node):
                 roll_target, pitch_target, yaw_rate_target, dt
             )
             self.motor_pwm = self._mix_motors(throttle, torque)
-            internal_dshot = np.array([self._pwm_to_dshot(v) for v in self.motor_pwm], dtype=int)
+            internal_dshot = np.array(
+                [self._pwm_to_dshot(v) for v in self.motor_pwm], dtype=int
+            )
             self.last_internal_dshot = internal_dshot
 
             self._publish_motor_command(internal_dshot)
@@ -778,6 +969,7 @@ class ManualDroneController(Node):
             self.get_logger().error(f"Failed to publish raw DSHOT value: {exc}")
 
     def _publish_imu_diagnostics(self) -> None:
+        # Existing primary-IMU diagnostic topics, unchanged.
         angle = Vector3()
         angle.x = math.degrees(float(self.relative_euler[0]))
         angle.y = math.degrees(float(self.relative_euler[1]))
@@ -789,6 +981,38 @@ class ManualDroneController(Node):
         gyro.y = float(self.gyro[1])
         gyro.z = float(self.gyro[2])
         self.imu_gyro_pub.publish(gyro)
+
+    def _publish_secondary_imu_diagnostics(self) -> None:
+        angle = Vector3()
+        angle.x = math.degrees(float(self.secondary_relative_euler[0]))
+        angle.y = math.degrees(float(self.secondary_relative_euler[1]))
+        angle.z = math.degrees(float(self.secondary_relative_euler[2]))
+        self.secondary_imu_angle_pub.publish(angle)
+
+        gyro = Vector3()
+        gyro.x = float(self.secondary_gyro[0])
+        gyro.y = float(self.secondary_gyro[1])
+        gyro.z = float(self.secondary_gyro[2])
+        self.secondary_imu_gyro_pub.publish(gyro)
+
+    def _publish_dual_imu_diagnostics(self) -> None:
+        common = Vector3()
+        common.x = float(self.imu_common_gyro[0])
+        common.y = float(self.imu_common_gyro[1])
+        common.z = float(self.imu_common_gyro[2])
+        self.imu_common_gyro_pub.publish(common)
+
+        diff = Vector3()
+        diff.x = float(self.imu_diff_gyro[0])
+        diff.y = float(self.imu_diff_gyro[1])
+        diff.z = float(self.imu_diff_gyro[2])
+        self.imu_diff_gyro_pub.publish(diff)
+
+        relative_angle = Vector3()
+        relative_angle.x = math.degrees(float(self.imu_relative_euler[0]))
+        relative_angle.y = math.degrees(float(self.imu_relative_euler[1]))
+        relative_angle.z = math.degrees(float(self.imu_relative_euler[2]))
+        self.imu_relative_angle_pub.publish(relative_angle)
 
     def _publish_control_diagnostics(
         self, torque: np.ndarray, pwm: np.ndarray, dshot: np.ndarray
@@ -860,7 +1084,6 @@ class ManualDroneController(Node):
         with self._lock:
             self.armed = False
             if not self.dry_run:
-                # Repeat the lock command to improve the chance it reaches the EtherCAT writer.
                 for _ in range(5):
                     self._publish_raw_dshot_uniform(self.dshot_lock_value)
                     time.sleep(0.01)
