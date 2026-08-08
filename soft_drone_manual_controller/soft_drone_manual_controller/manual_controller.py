@@ -5,19 +5,27 @@ Control path (unchanged for the original/primary IMU):
 DJI sticks -> attitude/rate setpoints -> quaternion outer loop -> rate PID ->
 X-frame mixer -> DSHOT.
 
-Dual-IMU addition:
+Dual-IMU / simplified DIMD addition:
 - Primary/original IMU: /ecat/sn2883658/app2/read
-  Continues to be the ONLY IMU used by the flight-control loop and arming failsafe.
+  Remains the ONLY IMU used by the original attitude loop, rate PID, arming, and
+  primary RC/IMU failsafe.
 - Secondary/new IMU: /ecat/sn2883658/app1/read
-  Observer/diagnostics only. It does not change attitude control, rate PID, mixer,
-  DSHOT, arming, or failsafe behavior.
+  Adds a separate structural-vibration damping branch inspired by DIMD:
+      aligned secondary gyro - primary gyro -> band-pass -> bounded auxiliary torque
+  The auxiliary torque is added AFTER the original attitude/rate controller and
+  BEFORE the existing motor mixer. If the secondary IMU is stale or unsynchronized,
+  the auxiliary torque becomes zero and the original controller continues unchanged.
 
 Both IMUs are mounted with the same physical orientation. Their raw sensor frame is
-FLU (x forward, y left, z up). The existing controller conversion is preserved
+FLU (x forward, y left, z up). The EXISTING controller conversion is preserved
 exactly for BOTH IMUs:
     quaternion [w, x, y, z] -> [w, x, -y, -z]
     vectors    [x, y, z]    -> [x, -y, -z]
 which yields the controller/body FRD frame (x forward, y right, z down).
+
+IMPORTANT: the DIMD alignment matrix is an optional calibration applied only AFTER
+this existing FLU->FRD conversion. Its default is the identity matrix, so it does
+not introduce or redefine any coordinate system.
 """
 
 from __future__ import annotations
@@ -170,6 +178,75 @@ class RatePid:
         return float(self.kp * error + self.ki * self.integral - self.kd * measurement_rate)
 
 
+@dataclass
+class BiquadBandPass:
+    """Second-order causal band-pass with 0 dB gain at the center frequency.
+
+    This is used only by the optional structural damping branch. The original
+    attitude/rate controller is not filtered or otherwise modified.
+    """
+
+    sample_rate_hz: float
+    center_frequency_hz: float
+    bandwidth_hz: float
+
+    def __post_init__(self) -> None:
+        self.x1 = 0.0
+        self.x2 = 0.0
+        self.y1 = 0.0
+        self.y2 = 0.0
+        self.configure(
+            self.sample_rate_hz,
+            self.center_frequency_hz,
+            self.bandwidth_hz,
+        )
+
+    def configure(
+        self, sample_rate_hz: float, center_frequency_hz: float, bandwidth_hz: float
+    ) -> None:
+        fs = max(1.0, float(sample_rate_hz))
+        nyquist = 0.5 * fs
+        f0 = clamp(float(center_frequency_hz), 1.0e-3, 0.45 * fs)
+        bw = max(1.0e-3, float(bandwidth_hz))
+        # Q = f0 / BW. A minimum Q avoids a degenerate coefficient set.
+        q = max(0.05, f0 / bw)
+
+        omega = 2.0 * math.pi * f0 / fs
+        alpha = math.sin(omega) / (2.0 * q)
+        a0 = 1.0 + alpha
+
+        self.b0 = alpha / a0
+        self.b1 = 0.0
+        self.b2 = -alpha / a0
+        self.a1 = (-2.0 * math.cos(omega)) / a0
+        self.a2 = (1.0 - alpha) / a0
+        self.sample_rate_hz = fs
+        self.center_frequency_hz = f0
+        self.bandwidth_hz = bw
+        self.nyquist_hz = nyquist
+
+    def reset(self) -> None:
+        self.x1 = 0.0
+        self.x2 = 0.0
+        self.y1 = 0.0
+        self.y2 = 0.0
+
+    def update(self, value: float) -> float:
+        x0 = float(value)
+        y0 = (
+            self.b0 * x0
+            + self.b1 * self.x1
+            + self.b2 * self.x2
+            - self.a1 * self.y1
+            - self.a2 * self.y2
+        )
+        self.x2 = self.x1
+        self.x1 = x0
+        self.y2 = self.y1
+        self.y1 = y0
+        return float(y0)
+
+
 class ManualDroneController(Node):
     def __init__(self) -> None:
         super().__init__("soft_drone_manual_controller")
@@ -187,8 +264,19 @@ class ManualDroneController(Node):
             "Manual controller started: DJI RC -> quaternion attitude -> rate PID -> DSHOT"
         )
         self.get_logger().info(
-            "Dual IMU: PRIMARY/old=%s (flight control), SECONDARY/new=%s (observer only)"
+            "Dual IMU: PRIMARY/old=%s (base flight control), SECONDARY/new=%s "
+            "(DIMD structural branch)"
             % (self.imu_topic, self.secondary_imu_topic)
+        )
+        self.get_logger().info(
+            "DIMD control is %s; f0=%.3f Hz, BW=%.3f Hz, gain=%s, limit=%s"
+            % (
+                "ENABLED" if self.dimd_enabled else "DISABLED",
+                self.dimd_center_frequency_hz,
+                self.dimd_bandwidth_hz,
+                self.dimd_gain.tolist(),
+                self.dimd_torque_limit.tolist(),
+            )
         )
         self.get_logger().warn(
             "DRY RUN is %s. Remove propellers before changing signs, mixer, or channel order."
@@ -276,6 +364,35 @@ class ManualDroneController(Node):
             # Keep the existing code default. YAML below keeps your current
             # runtime mapping [1, 0, 2, 3].
             "dshot_channel_order": [2, 0, 1, 3],
+
+            # --------------------------------------------------------------
+            # Simplified two-IMU DIMD structural damping branch.
+            # These parameters DO NOT change either IMU coordinate definition.
+            # The secondary-to-primary matrix is applied after both sensors have
+            # already undergone the exact same existing FLU -> FRD conversion.
+            # Identity is correct when both IMUs use the same physical axis
+            # orientation, as in the present aircraft.
+            # --------------------------------------------------------------
+            "dimd_enabled": False,
+            "dimd_secondary_timeout_s": 0.05,
+            "dimd_max_pair_skew_s": 0.005,
+            "dimd_secondary_to_primary_rotation_matrix_flat": [
+                1.0, 0.0, 0.0,
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0,
+            ],
+            # Set f0/BW from YOUR aircraft's measured structural spectrum.
+            # f0 <= 0 intentionally inhibits auxiliary torque.
+            "dimd_center_frequency_hz": 0.0,
+            "dimd_bandwidth_hz": 2.0,
+            # Signed gains map filtered structural-rate components directly to
+            # roll/pitch/yaw auxiliary moments. Start at zero and determine the
+            # sign with propellers removed / dry-run first.
+            "dimd_gain_xyz": [0.0, 0.0, 0.0],
+            "dimd_torque_limit_xyz": [0.02, 0.02, 0.02],
+            "dimd_residual_deadband_rad_s": 0.0,
+            "dimd_ramp_time_s": 1.0,
+
             "diagnostics_prefix": "/manual_drone",
             "status_log_period_s": 0.50,
         }
@@ -355,6 +472,44 @@ class ManualDroneController(Node):
         if sorted(self.dshot_channel_order) != [0, 1, 2, 3]:
             raise ValueError("dshot_channel_order must be a permutation of [0, 1, 2, 3]")
 
+        # Simplified DIMD branch. Existing base-flight parameters above are untouched.
+        self.dimd_enabled = bool(self._p("dimd_enabled"))
+        self.dimd_secondary_timeout_s = max(
+            0.001, float(self._p("dimd_secondary_timeout_s"))
+        )
+        self.dimd_max_pair_skew_s = max(
+            0.0, float(self._p("dimd_max_pair_skew_s"))
+        )
+        dimd_rotation_flat = np.asarray(
+            self._p("dimd_secondary_to_primary_rotation_matrix_flat"), dtype=float
+        )
+        if dimd_rotation_flat.size != 9:
+            raise ValueError(
+                "dimd_secondary_to_primary_rotation_matrix_flat must contain 9 numbers"
+            )
+        self.dimd_secondary_to_primary_rotation = dimd_rotation_flat.reshape((3, 3))
+        if not np.all(np.isfinite(self.dimd_secondary_to_primary_rotation)):
+            raise ValueError("DIMD secondary-to-primary rotation matrix must be finite")
+
+        self.dimd_center_frequency_hz = float(self._p("dimd_center_frequency_hz"))
+        self.dimd_bandwidth_hz = max(1.0e-3, float(self._p("dimd_bandwidth_hz")))
+        self.dimd_gain = np.asarray(self._p("dimd_gain_xyz"), dtype=float)
+        self.dimd_torque_limit = np.asarray(self._p("dimd_torque_limit_xyz"), dtype=float)
+        if self.dimd_gain.shape != (3,) or self.dimd_torque_limit.shape != (3,):
+            raise ValueError("dimd_gain_xyz and dimd_torque_limit_xyz must each have 3 values")
+        self.dimd_torque_limit = np.abs(self.dimd_torque_limit)
+        self.dimd_residual_deadband = max(
+            0.0, float(self._p("dimd_residual_deadband_rad_s"))
+        )
+        self.dimd_ramp_time_s = max(0.0, float(self._p("dimd_ramp_time_s")))
+
+        nyquist = 0.5 * self.control_frequency_hz
+        if self.dimd_center_frequency_hz > 0.0 and self.dimd_center_frequency_hz >= 0.45 * self.control_frequency_hz:
+            raise ValueError(
+                "dimd_center_frequency_hz must be below 45% of control_frequency_hz "
+                f"(current Nyquist={nyquist:.1f} Hz)"
+            )
+
         self.diagnostics_prefix = str(self._p("diagnostics_prefix")).rstrip("/")
         self.status_log_period_s = max(0.1, float(self._p("status_log_period_s")))
 
@@ -396,7 +551,8 @@ class ManualDroneController(Node):
             Imu, self.imu_topic, self._imu_callback, qos_best_effort
         )
 
-        # Secondary/new IMU. Observer only; never used by control or arming.
+        # Secondary/new IMU. It feeds the optional DIMD structural branch, but
+        # never replaces the primary IMU and never participates in arming/failsafe.
         self.secondary_imu_sub = self.create_subscription(
             Imu,
             self.secondary_imu_topic,
@@ -429,6 +585,28 @@ class ManualDroneController(Node):
             Vector3, f"{self.diagnostics_prefix}/imu_relative_angle_deg", qos_reliable
         )
 
+        # DIMD diagnostics. Existing diagnostic topic names above are unchanged.
+        self.dimd_secondary_aligned_pub = self.create_publisher(
+            Vector3,
+            f"{self.diagnostics_prefix}/dimd_secondary_gyro_aligned_rad_s",
+            qos_reliable,
+        )
+        self.dimd_residual_raw_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/dimd_residual_raw_rad_s", qos_reliable
+        )
+        self.dimd_modal_rate_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/dimd_modal_rate_rad_s", qos_reliable
+        )
+        self.dimd_torque_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/dimd_torque_command", qos_reliable
+        )
+        self.base_torque_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/torque_base_command", qos_reliable
+        )
+        self.dimd_active_pub = self.create_publisher(
+            Bool, f"{self.diagnostics_prefix}/dimd_active", qos_reliable
+        )
+
         self.torque_pub = self.create_publisher(
             Vector3, f"{self.diagnostics_prefix}/torque_command", qos_reliable
         )
@@ -456,6 +634,7 @@ class ManualDroneController(Node):
         }
         self.last_rc_time = 0.0
         self.last_imu_time = 0.0
+        self.primary_imu_stamp_s = 0.0
         self.last_control_time = 0.0
         self.last_status_log_time = 0.0
         self.last_arm_block_log_time = 0.0
@@ -480,6 +659,7 @@ class ManualDroneController(Node):
         self.secondary_gyro = np.zeros(3, dtype=float)
         self.secondary_imu_initialized = False
         self.last_secondary_imu_time = 0.0
+        self.secondary_imu_stamp_s = 0.0
 
         # Pair observer outputs, all expressed in the existing FRD body frame.
         self.imu_common_gyro = np.zeros(3, dtype=float)
@@ -487,6 +667,14 @@ class ManualDroneController(Node):
         self.imu_pair_reference_quat: np.ndarray | None = None
         self.imu_relative_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         self.imu_relative_euler = np.zeros(3, dtype=float)
+
+        # DIMD branch state. This is separate from the original controller state.
+        self.dimd_secondary_gyro_aligned = np.zeros(3, dtype=float)
+        self.dimd_residual_raw = np.zeros(3, dtype=float)
+        self.dimd_modal_rate = np.zeros(3, dtype=float)
+        self.dimd_torque = np.zeros(3, dtype=float)
+        self.dimd_active = False
+        self.dimd_ramp = 0.0
 
         self.armed = False
         self.arm_permission = not self.require_lock_cycle_to_arm
@@ -517,6 +705,24 @@ class ManualDroneController(Node):
             yaw_limit,
             self.rate_error_deadband,
         )
+
+        # One independent second-order band-pass per FRD axis. A placeholder
+        # center frequency is used internally when f0<=0 only so the objects can
+        # exist; _compute_dimd_torque() inhibits auxiliary torque until a real
+        # positive f0 is configured.
+        filter_center = (
+            self.dimd_center_frequency_hz
+            if self.dimd_center_frequency_hz > 0.0
+            else 1.0
+        )
+        self.dimd_filters = [
+            BiquadBandPass(
+                self.control_frequency_hz,
+                filter_center,
+                self.dimd_bandwidth_hz,
+            )
+            for _ in range(3)
+        ]
 
     # ------------------------------------------------------------------
     # Callbacks and safety state
@@ -620,13 +826,14 @@ class ManualDroneController(Node):
             # EXISTING conversion, unchanged: [x, y, z] -> [x, -y, -z].
             self.gyro = gyro_raw * self.gyro_signs
             self.last_imu_time = self._now_seconds()
+            self.primary_imu_stamp_s = self._message_stamp_seconds(message)
             self._publish_imu_diagnostics()
 
             # Observer update only. Does not feed anything back into control.
             self._update_dual_imu_observer()
 
     def _secondary_imu_callback(self, message: Imu) -> None:
-        """New IMU callback: observer only.
+        """New IMU callback for diagnostics and optional DIMD damping.
 
         The new IMU is mounted exactly like the original IMU, so it uses the
         SAME raw-FLU -> controller-FRD conversion. No additional rotation,
@@ -668,7 +875,7 @@ class ManualDroneController(Node):
                 self.secondary_imu_initialized = True
                 self.get_logger().info(
                     "Secondary IMU initialized with the same existing FRD conversion "
-                    "(observer only)"
+                    "(DIMD-capable branch)"
                 )
 
             self.secondary_relative_quat = quat_normalize(
@@ -691,6 +898,7 @@ class ManualDroneController(Node):
             )
             self.secondary_gyro = gyro_raw * self.gyro_signs
             self.last_secondary_imu_time = self._now_seconds()
+            self.secondary_imu_stamp_s = self._message_stamp_seconds(message)
 
             self._publish_secondary_imu_diagnostics()
             self._update_dual_imu_observer()
@@ -706,8 +914,9 @@ class ManualDroneController(Node):
 
         The diff signal is deliberately the full physical difference, not half
         the difference. For a perfectly anti-phase pair (+A and -A), diff=2A.
-        It is useful for later structural-vibration/PSD analysis but is NOT fed
-        into the flight controller in this version.
+        The existing imu_diff diagnostic remains observer-only. The DIMD branch
+        uses a separate aligned residual and only affects motors when explicitly
+        enabled with a valid f0 and nonzero gains.
         """
         if not self.imu_initialized or not self.secondary_imu_initialized:
             return
@@ -715,7 +924,16 @@ class ManualDroneController(Node):
             return
 
         self.imu_common_gyro = 0.5 * (self.gyro + self.secondary_gyro)
+        # EXISTING diagnostic meaning is preserved exactly.
         self.imu_diff_gyro = self.secondary_gyro - self.gyro
+
+        # DIMD uses a separate optional calibration matrix AFTER both IMUs have
+        # already been converted with the existing FLU -> FRD signs. The default
+        # matrix is identity, so no coordinate-system definition is changed.
+        self.dimd_secondary_gyro_aligned = (
+            self.dimd_secondary_to_primary_rotation @ self.secondary_gyro
+        )
+        self.dimd_residual_raw = self.dimd_secondary_gyro_aligned - self.gyro
 
         # Relative orientation between the two IMU-bearing rods.
         # Both q's have already undergone the SAME FLU -> FRD conversion.
@@ -789,6 +1007,7 @@ class ManualDroneController(Node):
         self.armed = True
         self.arm_permission = False
         self._reset_controllers()
+        self._reset_dimd_state()
         self.motor_pwm[:] = self.pwm_min_us
         self.get_logger().warn("ARMED in MANUAL mode")
         self._publish_raw_dshot_uniform(self.dshot_unlock_idle_value)
@@ -798,6 +1017,7 @@ class ManualDroneController(Node):
         was_armed = self.armed
         self.armed = False
         self._reset_controllers()
+        self._reset_dimd_state()
         self.motor_pwm[:] = self.pwm_min_us
         self._publish_raw_dshot_uniform(self.dshot_lock_value)
         self._publish_armed()
@@ -825,8 +1045,91 @@ class ManualDroneController(Node):
         self.pitch_rate_pid.reset()
         self.yaw_rate_pid.reset()
 
+    def _reset_dimd_state(self) -> None:
+        for filter_axis in getattr(self, "dimd_filters", []):
+            filter_axis.reset()
+        self.dimd_modal_rate[:] = 0.0
+        self.dimd_torque[:] = 0.0
+        self.dimd_active = False
+        self.dimd_ramp = 0.0
+
+    def _dimd_inputs_valid(self, now: float) -> bool:
+        if not self.imu_initialized or not self.secondary_imu_initialized:
+            return False
+        if self.last_secondary_imu_time <= 0.0:
+            return False
+        if (now - self.last_secondary_imu_time) > self.dimd_secondary_timeout_s:
+            return False
+
+        # Source timestamps are used only for pair synchronization. If either
+        # message has no useful stamp, freshness still protects the controller
+        # and we do not reject the pair solely for that reason.
+        if self.primary_imu_stamp_s > 0.0 and self.secondary_imu_stamp_s > 0.0:
+            if (
+                abs(self.primary_imu_stamp_s - self.secondary_imu_stamp_s)
+                > self.dimd_max_pair_skew_s
+            ):
+                return False
+        return True
+
+    def _compute_dimd_torque(self, now: float, dt: float) -> np.ndarray:
+        """Return optional bounded structural damping moment in existing FRD axes.
+
+        Simplified two-IMU DIMD branch:
+            secondary gyro (existing FRD)
+              -> optional fixed alignment calibration
+              -> subtract primary/body-reference gyro
+              -> second-order band-pass around measured structural mode
+              -> signed per-axis gain
+              -> per-axis auxiliary moment saturation
+
+        The original attitude/rate controller never consumes the secondary IMU.
+        Any invalid secondary input makes this function return exactly zero.
+        """
+        self.dimd_torque[:] = 0.0
+        self.dimd_active = False
+
+        if not self.dimd_enabled:
+            self.dimd_ramp = 0.0
+            return self.dimd_torque.copy()
+        if self.dimd_center_frequency_hz <= 0.0:
+            self.dimd_ramp = 0.0
+            return self.dimd_torque.copy()
+        if not self._dimd_inputs_valid(now):
+            self._reset_dimd_state()
+            return self.dimd_torque.copy()
+
+        residual = self.dimd_residual_raw.copy()
+        if self.dimd_residual_deadband > 0.0:
+            residual = np.array(
+                [
+                    apply_deadzone(float(v), self.dimd_residual_deadband)
+                    for v in residual
+                ],
+                dtype=float,
+            )
+
+        self.dimd_modal_rate = np.array(
+            [self.dimd_filters[i].update(float(residual[i])) for i in range(3)],
+            dtype=float,
+        )
+
+        requested = self.dimd_gain * self.dimd_modal_rate
+        requested = np.clip(
+            requested, -self.dimd_torque_limit, self.dimd_torque_limit
+        )
+
+        if self.dimd_ramp_time_s > 0.0:
+            self.dimd_ramp = min(1.0, self.dimd_ramp + dt / self.dimd_ramp_time_s)
+        else:
+            self.dimd_ramp = 1.0
+
+        self.dimd_torque = requested * self.dimd_ramp
+        self.dimd_active = True
+        return self.dimd_torque.copy()
+
     # ------------------------------------------------------------------
-    # Manual flight control -- unchanged control structure
+    # Manual flight control -- original base controller unchanged
     # ------------------------------------------------------------------
     def _process_sticks(self) -> tuple[float, float, float, float]:
         roll_raw = apply_deadzone(self.rc_data["right_x"], self.deadzone_roll)
@@ -916,9 +1219,38 @@ class ManualDroneController(Node):
                 return
 
             throttle, roll_target, pitch_target, yaw_rate_target = self._process_sticks()
-            torque = self._attitude_and_rate_control(
+
+            # Existing base controller is unchanged and still uses ONLY app2.
+            torque_base = self._attitude_and_rate_control(
                 roll_target, pitch_target, yaw_rate_target, dt
             )
+
+            # Simplified DIMD auxiliary structural damping branch from app1.
+            # A stale/invalid app1 makes torque_dimd exactly zero; it never
+            # disarms or replaces the original app2 control path.
+            torque_dimd = self._compute_dimd_torque(now, dt)
+            torque = torque_base + torque_dimd
+            torque = np.array(
+                [
+                    clamp(
+                        float(torque[0]),
+                        -self.roll_pitch_torque_limit,
+                        self.roll_pitch_torque_limit,
+                    ),
+                    clamp(
+                        float(torque[1]),
+                        -self.roll_pitch_torque_limit,
+                        self.roll_pitch_torque_limit,
+                    ),
+                    clamp(
+                        float(torque[2]),
+                        -self.yaw_torque_limit,
+                        self.yaw_torque_limit,
+                    ),
+                ],
+                dtype=float,
+            )
+
             self.motor_pwm = self._mix_motors(throttle, torque)
             internal_dshot = np.array(
                 [self._pwm_to_dshot(v) for v in self.motor_pwm], dtype=int
@@ -926,7 +1258,13 @@ class ManualDroneController(Node):
             self.last_internal_dshot = internal_dshot
 
             self._publish_motor_command(internal_dshot)
-            self._publish_control_diagnostics(torque, self.motor_pwm, internal_dshot)
+            self._publish_control_diagnostics(
+                torque,
+                self.motor_pwm,
+                internal_dshot,
+                torque_base=torque_base,
+                torque_dimd=torque_dimd,
+            )
             self._log_status(now, roll_target, pitch_target, yaw_rate_target)
 
     # ------------------------------------------------------------------
@@ -1014,12 +1352,46 @@ class ManualDroneController(Node):
         relative_angle.z = math.degrees(float(self.imu_relative_euler[2]))
         self.imu_relative_angle_pub.publish(relative_angle)
 
+        aligned = Vector3()
+        aligned.x, aligned.y, aligned.z = [
+            float(v) for v in self.dimd_secondary_gyro_aligned
+        ]
+        self.dimd_secondary_aligned_pub.publish(aligned)
+
+        residual = Vector3()
+        residual.x, residual.y, residual.z = [float(v) for v in self.dimd_residual_raw]
+        self.dimd_residual_raw_pub.publish(residual)
+
     def _publish_control_diagnostics(
-        self, torque: np.ndarray, pwm: np.ndarray, dshot: np.ndarray
+        self,
+        torque: np.ndarray,
+        pwm: np.ndarray,
+        dshot: np.ndarray,
+        *,
+        torque_base: np.ndarray | None = None,
+        torque_dimd: np.ndarray | None = None,
     ) -> None:
         torque_msg = Vector3()
         torque_msg.x, torque_msg.y, torque_msg.z = [float(v) for v in torque]
         self.torque_pub.publish(torque_msg)
+
+        base_values = torque if torque_base is None else torque_base
+        base_msg = Vector3()
+        base_msg.x, base_msg.y, base_msg.z = [float(v) for v in base_values]
+        self.base_torque_pub.publish(base_msg)
+
+        dimd_values = np.zeros(3, dtype=float) if torque_dimd is None else torque_dimd
+        dimd_msg = Vector3()
+        dimd_msg.x, dimd_msg.y, dimd_msg.z = [float(v) for v in dimd_values]
+        self.dimd_torque_pub.publish(dimd_msg)
+
+        modal_msg = Vector3()
+        modal_msg.x, modal_msg.y, modal_msg.z = [float(v) for v in self.dimd_modal_rate]
+        self.dimd_modal_rate_pub.publish(modal_msg)
+
+        active_msg = Bool()
+        active_msg.data = bool(self.dimd_active)
+        self.dimd_active_pub.publish(active_msg)
 
         pwm_msg = Float64MultiArray()
         pwm_msg.data = [float(v) for v in pwm]
@@ -1044,7 +1416,7 @@ class ManualDroneController(Node):
         roll, pitch, yaw = [math.degrees(float(v)) for v in self.relative_euler]
         self.get_logger().info(
             "MANUAL | RPY=(%.1f, %.1f, %.1f) deg | target RP=(%.1f, %.1f) deg | "
-            "yaw rate=%.2f rad/s | PWM=%s | DSHOT=%s%s"
+            "yaw rate=%.2f rad/s | PWM=%s | DSHOT=%s | DIMD=%s%s"
             % (
                 roll,
                 pitch,
@@ -1054,6 +1426,7 @@ class ManualDroneController(Node):
                 yaw_rate_target,
                 np.rint(self.motor_pwm).astype(int).tolist(),
                 self.last_internal_dshot.tolist(),
+                "ACTIVE" if self.dimd_active else "OFF",
                 " | DRY_RUN" if self.dry_run else "",
             )
         )
@@ -1063,6 +1436,16 @@ class ManualDroneController(Node):
     # ------------------------------------------------------------------
     def _now_seconds(self) -> float:
         return self.get_clock().now().nanoseconds / 1.0e9
+
+    @staticmethod
+    def _message_stamp_seconds(message: Imu) -> float:
+        try:
+            sec = float(message.header.stamp.sec)
+            nanosec = float(message.header.stamp.nanosec)
+            stamp = sec + nanosec * 1.0e-9
+            return stamp if stamp > 0.0 else 0.0
+        except (AttributeError, TypeError, ValueError):
+            return 0.0
 
     def _compute_dt(self, now: float) -> float:
         if self.last_control_time <= 0.0:
@@ -1083,10 +1466,18 @@ class ManualDroneController(Node):
     def safe_shutdown(self) -> None:
         with self._lock:
             self.armed = False
-            if not self.dry_run:
+            self._reset_dimd_state()
+            # rclpy may already have invalidated the context after Ctrl+C.
+            # In that case do not attempt the old final DSHOT publishes, which
+            # otherwise raise "publisher's context is invalid" during shutdown.
+            if self.dry_run or not rclpy.ok():
+                return
+            try:
                 for _ in range(5):
                     self._publish_raw_dshot_uniform(self.dshot_lock_value)
                     time.sleep(0.01)
+            except Exception as exc:  # shutdown must never mask process exit
+                self.get_logger().warn(f"Shutdown DSHOT publish skipped: {exc}")
 
 
 def main(args: Sequence[str] | None = None) -> None:

@@ -98,6 +98,46 @@ soft_drone_manual_controller:
     # Keep your current runtime motor-channel mapping unchanged.
     dshot_channel_order: [1, 0, 2, 3]
 
+    # -------- Simplified two-IMU DIMD structural damping --------
+    # The original app2 attitude/rate controller above is NOT changed.
+    # app1 only adds an auxiliary structural-damping torque AFTER the original
+    # controller and BEFORE the existing mixer. If app1 is stale/unsynchronized,
+    # DIMD torque becomes exactly zero and app2 continues normal flight control.
+    #
+    # IMPORTANT: keep false until you have identified YOUR aircraft's structural
+    # resonance frequency and verified the damping sign with propellers removed.
+    dimd_enabled: false
+
+    # Secondary IMU validity for the auxiliary branch only. A failure here does
+    # NOT disarm the aircraft; it only disables DIMD torque.
+    dimd_secondary_timeout_s: 0.05
+    dimd_max_pair_skew_s: 0.005
+
+    # This is NOT a new coordinate system. Both IMUs first keep the exact existing
+    # FLU -> FRD conversion defined above. This optional calibration matrix is
+    # applied afterwards to secondary gyro only. Because both IMUs are installed
+    # with the same axis direction, keep identity unless a rigid-body gyro
+    # calibration later gives you a measured 3x3 correction matrix.
+    dimd_secondary_to_primary_rotation_matrix_flat: [1.0, 0.0, 0.0,
+                                                     0.0, 1.0, 0.0,
+                                                     0.0, 0.0, 1.0]
+
+    # Set these from rosbag/FFT/PSD of this aircraft. f0 <= 0 intentionally
+    # inhibits the auxiliary torque even if dimd_enabled is accidentally true.
+    dimd_center_frequency_hz: 0.0
+    dimd_bandwidth_hz: 2.0
+
+    # Signed mapping: filtered structural-rate xyz -> auxiliary roll/pitch/yaw
+    # torque. Start from zero. After determining the correct sign, increase one
+    # axis at a time. Do NOT copy gains/frequencies from another aircraft/paper.
+    dimd_gain_xyz: [0.0, 0.0, 0.0]
+
+    # Independent auxiliary torque limits. These are deliberately much smaller
+    # than the existing base-controller torque limits above.
+    dimd_torque_limit_xyz: [0.02, 0.02, 0.02]
+    dimd_residual_deadband_rad_s: 0.0
+    dimd_ramp_time_s: 1.0
+
     # -------- Diagnostics --------
     diagnostics_prefix: /manual_drone
     status_log_period_s: 0.50
