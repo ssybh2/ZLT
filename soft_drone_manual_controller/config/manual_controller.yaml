@@ -138,8 +138,8 @@ soft_drone_manual_controller:
 
     # Set these from rosbag/FFT/PSD of this aircraft. f0 <= 0 intentionally
     # inhibits the auxiliary torque even if dimd_enabled is accidentally true.
-    dimd_center_frequency_hz: 0.0
-    dimd_bandwidth_hz: 2.0
+    dimd_center_frequency_hz: 9.3
+    dimd_bandwidth_hz: 3.0
 
     # Signed mapping: filtered structural-rate xyz -> auxiliary roll/pitch/yaw
     # torque. Start from zero. After determining the correct sign, increase one
