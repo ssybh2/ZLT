@@ -13,8 +13,10 @@ Dual-IMU / simplified DIMD addition:
   Adds a separate structural-vibration damping branch inspired by DIMD:
       aligned secondary gyro - primary gyro -> band-pass -> bounded auxiliary torque
   The auxiliary torque is added AFTER the original attitude/rate controller and
-  BEFORE the existing motor mixer. If the secondary IMU is stale or unsynchronized,
-  the auxiliary torque becomes zero and the original controller continues unchanged.
+  BEFORE the existing motor mixer. If the secondary IMU is stale, unsynchronized,
+  or has an invalid payload, the auxiliary torque becomes zero immediately and the
+  original controller continues unchanged. DIMD only returns after a healthy hold
+  period and then ramps in smoothly.
 
 Both IMUs are mounted with the same physical orientation. Their raw sensor frame is
 FLU (x forward, y left, z up). The EXISTING controller conversion is preserved
@@ -44,7 +46,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from rosidl_runtime_py.utilities import get_message
 from sensor_msgs.msg import Imu
-from std_msgs.msg import Bool, Float64MultiArray
+from std_msgs.msg import Bool, Float64MultiArray, String
 from std_srvs.srv import Trigger
 
 
@@ -376,6 +378,15 @@ class ManualDroneController(Node):
             "dimd_enabled": False,
             "dimd_secondary_timeout_s": 0.05,
             "dimd_max_pair_skew_s": 0.005,
+            # Secondary-IMU health/fallback protection. Any invalid sample causes
+            # immediate fallback to primary/app2-only control. Recovery is
+            # deliberately slower to avoid rapid DIMD on/off chatter.
+            "dimd_health_accel_min_norm_m_s2": 0.5,
+            "dimd_health_quaternion_norm_min": 0.5,
+            "dimd_health_quaternion_norm_max": 1.5,
+            "dimd_health_recovery_hold_s": 0.50,
+            "dimd_health_recovery_min_samples": 50,
+            "dimd_health_publish_period_s": 0.10,
             "dimd_secondary_to_primary_rotation_matrix_flat": [
                 1.0, 0.0, 0.0,
                 0.0, 1.0, 0.0,
@@ -479,6 +490,25 @@ class ManualDroneController(Node):
         )
         self.dimd_max_pair_skew_s = max(
             0.0, float(self._p("dimd_max_pair_skew_s"))
+        )
+        self.dimd_health_accel_min_norm = max(
+            0.0, float(self._p("dimd_health_accel_min_norm_m_s2"))
+        )
+        self.dimd_health_quaternion_norm_min = max(
+            0.0, float(self._p("dimd_health_quaternion_norm_min"))
+        )
+        self.dimd_health_quaternion_norm_max = max(
+            self.dimd_health_quaternion_norm_min,
+            float(self._p("dimd_health_quaternion_norm_max")),
+        )
+        self.dimd_health_recovery_hold_s = max(
+            0.0, float(self._p("dimd_health_recovery_hold_s"))
+        )
+        self.dimd_health_recovery_min_samples = max(
+            1, int(self._p("dimd_health_recovery_min_samples"))
+        )
+        self.dimd_health_publish_period_s = max(
+            0.02, float(self._p("dimd_health_publish_period_s"))
         )
         dimd_rotation_flat = np.asarray(
             self._p("dimd_secondary_to_primary_rotation_matrix_flat"), dtype=float
@@ -606,6 +636,15 @@ class ManualDroneController(Node):
         self.dimd_active_pub = self.create_publisher(
             Bool, f"{self.diagnostics_prefix}/dimd_active", qos_reliable
         )
+        self.dimd_secondary_healthy_pub = self.create_publisher(
+            Bool, f"{self.diagnostics_prefix}/dimd_secondary_healthy", qos_reliable
+        )
+        self.dimd_fallback_pub = self.create_publisher(
+            Bool, f"{self.diagnostics_prefix}/dimd_fallback_active", qos_reliable
+        )
+        self.dimd_health_reason_pub = self.create_publisher(
+            String, f"{self.diagnostics_prefix}/dimd_health_reason", qos_reliable
+        )
 
         self.torque_pub = self.create_publisher(
             Vector3, f"{self.diagnostics_prefix}/torque_command", qos_reliable
@@ -657,9 +696,21 @@ class ManualDroneController(Node):
         self.secondary_relative_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         self.secondary_relative_euler = np.zeros(3, dtype=float)
         self.secondary_gyro = np.zeros(3, dtype=float)
+        self.secondary_accel = np.zeros(3, dtype=float)
         self.secondary_imu_initialized = False
         self.last_secondary_imu_time = 0.0
         self.secondary_imu_stamp_s = 0.0
+
+        # Secondary-IMU health state. Invalid app1 data NEVER affects the base
+        # controller: it only forces DIMD torque to zero. Recovery requires a
+        # continuous healthy window before DIMD is allowed to ramp back in.
+        self.secondary_sample_valid = False
+        self.dimd_secondary_healthy = False
+        self.dimd_secondary_health_reason = "startup"
+        self.dimd_secondary_recovery_start_time = 0.0
+        self.dimd_secondary_recovery_samples = 0
+        self.dimd_secondary_fault_count = 0
+        self.last_dimd_health_publish_time = 0.0
 
         # Pair observer outputs, all expressed in the existing FRD body frame.
         self.imu_common_gyro = np.zeros(3, dtype=float)
@@ -838,8 +889,18 @@ class ManualDroneController(Node):
         The new IMU is mounted exactly like the original IMU, so it uses the
         SAME raw-FLU -> controller-FRD conversion. No additional rotation,
         remapping, or coordinate-frame definition is introduced.
+
+        Health protection is fail-fast / recover-slow:
+        - one clearly invalid secondary sample immediately disables DIMD;
+        - the original app2 controller continues completely unchanged;
+        - app1 must remain continuously healthy for the configured recovery
+          window before DIMD is allowed to ramp back in.
         """
         with self._lock:
+            now = self._now_seconds()
+            self.last_secondary_imu_time = now
+            self.secondary_imu_stamp_s = self._message_stamp_seconds(message)
+
             q_raw = np.array(
                 [
                     message.orientation.w,
@@ -849,23 +910,52 @@ class ManualDroneController(Node):
                 ],
                 dtype=float,
             )
+            accel_raw = np.array(
+                [
+                    message.linear_acceleration.x,
+                    message.linear_acceleration.y,
+                    message.linear_acceleration.z,
+                ],
+                dtype=float,
+            )
+            gyro_raw = np.array(
+                [
+                    message.angular_velocity.x,
+                    message.angular_velocity.y,
+                    message.angular_velocity.z,
+                ],
+                dtype=float,
+            )
 
-            # Same conversion as the original IMU: FLU -> FRD.
+            sample_valid, reason = self._validate_secondary_imu_sample(
+                q_raw, accel_raw, gyro_raw
+            )
+            self.secondary_sample_valid = sample_valid
+            self._update_secondary_health_from_sample(now, sample_valid, reason)
+
+            # Never copy an invalid app1 sample into the observer/DIMD state.
+            # The last good sample may remain stored, but health=false guarantees
+            # _compute_dimd_torque() returns exactly zero.
+            if not sample_valid:
+                self._publish_dimd_health_diagnostics(now, force=True)
+                return
+
+            # SAME existing conversion as the original IMU: FLU -> FRD.
             q_abs = quat_normalize(q_raw * self.quaternion_signs)
+            accel_frd = accel_raw * self.gyro_signs
+            gyro_frd = gyro_raw * self.gyro_signs
+
             self.secondary_current_abs_quat = q_abs
+            self.secondary_accel = accel_frd
+            self.secondary_gyro = gyro_frd
 
             if self.secondary_initial_quat is None:
-                accel_raw = np.array(
-                    [
-                        message.linear_acceleration.x,
-                        message.linear_acceleration.y,
-                        message.linear_acceleration.z,
-                    ],
-                    dtype=float,
-                )
-                accel_frd = accel_raw * self.gyro_signs
                 q_gravity_tilt = gravity_tilt_quat_frd(accel_frd)
                 if q_gravity_tilt is None:
+                    self._set_secondary_health_fault(
+                        "gravity_initialization_failed", now
+                    )
+                    self._publish_dimd_health_diagnostics(now, force=True)
                     return
 
                 # Same initialization convention as the original IMU.
@@ -888,20 +978,9 @@ class ManualDroneController(Node):
                 float(self.secondary_relative_euler[2])
             )
 
-            gyro_raw = np.array(
-                [
-                    message.angular_velocity.x,
-                    message.angular_velocity.y,
-                    message.angular_velocity.z,
-                ],
-                dtype=float,
-            )
-            self.secondary_gyro = gyro_raw * self.gyro_signs
-            self.last_secondary_imu_time = self._now_seconds()
-            self.secondary_imu_stamp_s = self._message_stamp_seconds(message)
-
             self._publish_secondary_imu_diagnostics()
             self._update_dual_imu_observer()
+            self._publish_dimd_health_diagnostics(now)
 
     def _update_dual_imu_observer(self) -> None:
         """Compute observer-only quantities after both IMUs are valid.
@@ -959,6 +1038,133 @@ class ManualDroneController(Node):
         self.imu_relative_euler[2] = wrap_pi(float(self.imu_relative_euler[2]))
 
         self._publish_dual_imu_diagnostics()
+
+    def _validate_secondary_imu_sample(
+        self,
+        q_raw: np.ndarray,
+        accel_raw: np.ndarray,
+        gyro_raw: np.ndarray,
+    ) -> tuple[bool, str]:
+        """Validate one raw app1 message without changing coordinate definitions.
+
+        The observed failure mode is orientation still present while acceleration
+        and angular velocity collapse to zeros. Acceleration is the strongest
+        health discriminator because a normal grounded/flying vehicle should not
+        report a near-zero specific-force vector continuously, whereas zero gyro
+        can be perfectly valid when stationary.
+        """
+        if not (
+            np.all(np.isfinite(q_raw))
+            and np.all(np.isfinite(accel_raw))
+            and np.all(np.isfinite(gyro_raw))
+        ):
+            return False, "non_finite_secondary_sample"
+
+        q_norm = float(np.linalg.norm(q_raw))
+        if not (
+            self.dimd_health_quaternion_norm_min
+            <= q_norm
+            <= self.dimd_health_quaternion_norm_max
+        ):
+            return False, "secondary_quaternion_norm_invalid"
+
+        accel_norm = float(np.linalg.norm(accel_raw))
+        if accel_norm < self.dimd_health_accel_min_norm:
+            return False, "secondary_acceleration_missing_or_zero"
+
+        return True, "ok"
+
+    def _set_secondary_health_fault(self, reason: str, now: float) -> None:
+        was_healthy = self.dimd_secondary_healthy
+        old_reason = self.dimd_secondary_health_reason
+        was_recovering = self.dimd_secondary_recovery_start_time > 0.0
+        transition = was_healthy or old_reason != reason or was_recovering
+
+        self.dimd_secondary_healthy = False
+        self.dimd_secondary_health_reason = str(reason)
+        self.dimd_secondary_recovery_start_time = 0.0
+        self.dimd_secondary_recovery_samples = 0
+
+        if not transition:
+            return
+
+        self.dimd_secondary_fault_count += 1
+
+        # Immediately remove all DIMD memory/torque. Base app2 flight control is
+        # untouched and continues in the same control-loop iteration.
+        self._reset_dimd_state()
+
+        log = self.get_logger().warn if self.dimd_enabled else self.get_logger().info
+        log(
+            "DIMD FALLBACK -> PRIMARY/app2 ONLY: secondary IMU unhealthy "
+            f"({reason}); DIMD torque forced to zero"
+        )
+        self._publish_dimd_health_diagnostics(now, force=True)
+
+    def _update_secondary_health_from_sample(
+        self, now: float, sample_valid: bool, reason: str
+    ) -> None:
+        if not sample_valid:
+            self._set_secondary_health_fault(reason, now)
+            return
+
+        if self.dimd_secondary_healthy:
+            self.dimd_secondary_health_reason = "ok"
+            return
+
+        if self.dimd_secondary_recovery_start_time <= 0.0:
+            self.dimd_secondary_recovery_start_time = now
+            self.dimd_secondary_recovery_samples = 1
+            self.dimd_secondary_health_reason = "recovering"
+            return
+
+        self.dimd_secondary_recovery_samples += 1
+        healthy_time = now - self.dimd_secondary_recovery_start_time
+        if (
+            healthy_time >= self.dimd_health_recovery_hold_s
+            and self.dimd_secondary_recovery_samples
+            >= self.dimd_health_recovery_min_samples
+        ):
+            self.dimd_secondary_healthy = True
+            self.dimd_secondary_health_reason = "ok"
+            self._reset_dimd_state()
+            self.get_logger().info(
+                "Secondary IMU healthy again after %.3f s / %d valid samples; "
+                "DIMD may re-enter with %.3f s ramp if enabled"
+                % (
+                    healthy_time,
+                    self.dimd_secondary_recovery_samples,
+                    self.dimd_ramp_time_s,
+                )
+            )
+            self._publish_dimd_health_diagnostics(now, force=True)
+
+    def _publish_dimd_health_diagnostics(
+        self, now: float | None = None, *, force: bool = False
+    ) -> None:
+        if now is None:
+            now = self._now_seconds()
+        if (
+            not force
+            and (now - self.last_dimd_health_publish_time)
+            < self.dimd_health_publish_period_s
+        ):
+            return
+        self.last_dimd_health_publish_time = now
+
+        healthy_msg = Bool()
+        healthy_msg.data = bool(self.dimd_secondary_healthy)
+        self.dimd_secondary_healthy_pub.publish(healthy_msg)
+
+        fallback_msg = Bool()
+        fallback_msg.data = bool(
+            self.dimd_enabled and not self.dimd_secondary_healthy
+        )
+        self.dimd_fallback_pub.publish(fallback_msg)
+
+        reason_msg = String()
+        reason_msg.data = str(self.dimd_secondary_health_reason)
+        self.dimd_health_reason_pub.publish(reason_msg)
 
     def _reset_zero_callback(
         self, _request: Trigger.Request, response: Trigger.Response
@@ -1056,19 +1262,22 @@ class ManualDroneController(Node):
     def _dimd_inputs_valid(self, now: float) -> bool:
         if not self.imu_initialized or not self.secondary_imu_initialized:
             return False
+        if not self.secondary_sample_valid or not self.dimd_secondary_healthy:
+            return False
         if self.last_secondary_imu_time <= 0.0:
             return False
         if (now - self.last_secondary_imu_time) > self.dimd_secondary_timeout_s:
+            self._set_secondary_health_fault("secondary_timeout", now)
             return False
 
-        # Source timestamps are used only for pair synchronization. If either
-        # message has no useful stamp, freshness still protects the controller
-        # and we do not reject the pair solely for that reason.
+        # Source timestamps are used for pair synchronization. A bad pair does
+        # not disarm the aircraft; it immediately drops only the DIMD branch.
         if self.primary_imu_stamp_s > 0.0 and self.secondary_imu_stamp_s > 0.0:
             if (
                 abs(self.primary_imu_stamp_s - self.secondary_imu_stamp_s)
                 > self.dimd_max_pair_skew_s
             ):
+                self._set_secondary_health_fault("imu_pair_timestamp_skew", now)
                 return False
         return True
 
@@ -1392,6 +1601,7 @@ class ManualDroneController(Node):
         active_msg = Bool()
         active_msg.data = bool(self.dimd_active)
         self.dimd_active_pub.publish(active_msg)
+        self._publish_dimd_health_diagnostics()
 
         pwm_msg = Float64MultiArray()
         pwm_msg.data = [float(v) for v in pwm]
@@ -1416,7 +1626,7 @@ class ManualDroneController(Node):
         roll, pitch, yaw = [math.degrees(float(v)) for v in self.relative_euler]
         self.get_logger().info(
             "MANUAL | RPY=(%.1f, %.1f, %.1f) deg | target RP=(%.1f, %.1f) deg | "
-            "yaw rate=%.2f rad/s | PWM=%s | DSHOT=%s | DIMD=%s%s"
+            "yaw rate=%.2f rad/s | PWM=%s | DSHOT=%s | DIMD=%s | SEC=%s%s"
             % (
                 roll,
                 pitch,
@@ -1427,6 +1637,7 @@ class ManualDroneController(Node):
                 np.rint(self.motor_pwm).astype(int).tolist(),
                 self.last_internal_dshot.tolist(),
                 "ACTIVE" if self.dimd_active else "OFF",
+                "HEALTHY" if self.dimd_secondary_healthy else self.dimd_secondary_health_reason,
                 " | DRY_RUN" if self.dry_run else "",
             )
         )

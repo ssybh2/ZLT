@@ -106,12 +106,26 @@ soft_drone_manual_controller:
     #
     # IMPORTANT: keep false until you have identified YOUR aircraft's structural
     # resonance frequency and verified the damping sign with propellers removed.
-    dimd_enabled: false
+    dimd_enabled: true
 
     # Secondary IMU validity for the auxiliary branch only. A failure here does
     # NOT disarm the aircraft; it only disables DIMD torque.
     dimd_secondary_timeout_s: 0.05
     dimd_max_pair_skew_s: 0.005
+
+    # -------- Secondary-IMU health / automatic fallback --------
+    # Fail fast: any clearly invalid app1 sample immediately forces DIMD torque
+    # to zero, while the original app2 attitude/rate controller keeps flying.
+    # Recover slow: app1 must stay healthy continuously before DIMD can re-enter.
+    # The observed bug has acceleration collapsing to [0,0,0], so acceleration
+    # norm is used as the strongest payload-health discriminator. Zero gyro alone
+    # is NOT treated as a fault because it is valid when the vehicle is stationary.
+    dimd_health_accel_min_norm_m_s2: 0.5
+    dimd_health_quaternion_norm_min: 0.5
+    dimd_health_quaternion_norm_max: 1.5
+    dimd_health_recovery_hold_s: 0.50
+    dimd_health_recovery_min_samples: 50
+    dimd_health_publish_period_s: 0.10
 
     # This is NOT a new coordinate system. Both IMUs first keep the exact existing
     # FLU -> FRD conversion defined above. This optional calibration matrix is
