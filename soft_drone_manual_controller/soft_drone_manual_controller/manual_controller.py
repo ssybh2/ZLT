@@ -181,72 +181,108 @@ class RatePid:
 
 
 @dataclass
-class BiquadBandPass:
-    """Second-order causal band-pass with 0 dB gain at the center frequency.
+class ContinuousBandPass:
+    """Second-order causal band-pass evaluated with the actual loop dt.
 
-    This is used only by the optional structural damping branch. The original
-    attitude/rate controller is not filtered or otherwise modified.
+    Transfer function:
+        H(s) = a*s / (s^2 + a*s + w0^2)
+
+    where:
+        w0 = 2*pi*f0
+        a  = 2*pi*bandwidth
+
+    The filter has approximately 0 dB gain at f0. Its continuous states are
+    integrated with RK4 using small internal substeps, so changing control-loop
+    dt does NOT require changing discrete IIR coefficients or reusing state from
+    a different coefficient set.
+
+    This class is used only by the optional DIMD branch. The original/app2
+    attitude and rate controller are untouched.
     """
 
-    sample_rate_hz: float
     center_frequency_hz: float
     bandwidth_hz: float
+    max_integration_step_s: float = 0.0025
 
     def __post_init__(self) -> None:
-        self.x1 = 0.0
-        self.x2 = 0.0
-        self.y1 = 0.0
-        self.y2 = 0.0
-        self.configure(
-            self.sample_rate_hz,
-            self.center_frequency_hz,
-            self.bandwidth_hz,
+        self.configure(self.center_frequency_hz, self.bandwidth_hz)
+        self.reset()
+
+    def configure(self, center_frequency_hz: float, bandwidth_hz: float) -> None:
+        self.center_frequency_hz = max(1.0e-3, float(center_frequency_hz))
+        self.bandwidth_hz = max(1.0e-3, float(bandwidth_hz))
+        self.omega0 = 2.0 * math.pi * self.center_frequency_hz
+        # Since Q=f0/BW, omega0/Q = 2*pi*BW.
+        self.damping_rate = 2.0 * math.pi * self.bandwidth_hz
+        self.max_integration_step_s = max(
+            2.5e-4, float(self.max_integration_step_s)
         )
-
-    def configure(
-        self, sample_rate_hz: float, center_frequency_hz: float, bandwidth_hz: float
-    ) -> None:
-        fs = max(1.0, float(sample_rate_hz))
-        nyquist = 0.5 * fs
-        f0 = clamp(float(center_frequency_hz), 1.0e-3, 0.45 * fs)
-        bw = max(1.0e-3, float(bandwidth_hz))
-        # Q = f0 / BW. A minimum Q avoids a degenerate coefficient set.
-        q = max(0.05, f0 / bw)
-
-        omega = 2.0 * math.pi * f0 / fs
-        alpha = math.sin(omega) / (2.0 * q)
-        a0 = 1.0 + alpha
-
-        self.b0 = alpha / a0
-        self.b1 = 0.0
-        self.b2 = -alpha / a0
-        self.a1 = (-2.0 * math.cos(omega)) / a0
-        self.a2 = (1.0 - alpha) / a0
-        self.sample_rate_hz = fs
-        self.center_frequency_hz = f0
-        self.bandwidth_hz = bw
-        self.nyquist_hz = nyquist
 
     def reset(self) -> None:
-        self.x1 = 0.0
-        self.x2 = 0.0
-        self.y1 = 0.0
-        self.y2 = 0.0
+        self.state_position = 0.0
+        self.state_rate = 0.0
 
-    def update(self, value: float) -> float:
-        x0 = float(value)
-        y0 = (
-            self.b0 * x0
-            + self.b1 * self.x1
-            + self.b2 * self.x2
-            - self.a1 * self.y1
-            - self.a2 * self.y2
+    def _derivative(
+        self, position: float, rate: float, value: float
+    ) -> tuple[float, float]:
+        d_position = rate
+        d_rate = (
+            -(self.omega0 * self.omega0) * position
+            - self.damping_rate * rate
+            + self.damping_rate * value
         )
-        self.x2 = self.x1
-        self.x1 = x0
-        self.y2 = self.y1
-        self.y1 = y0
-        return float(y0)
+        return float(d_position), float(d_rate)
+
+    def update(self, value: float, dt: float) -> float:
+        """Advance the band-pass using the real elapsed control-loop time."""
+        value = float(value)
+        dt = float(dt)
+
+        if not math.isfinite(value):
+            return 0.0
+        if not math.isfinite(dt) or dt <= 0.0:
+            return float(self.state_rate)
+
+        # A very long scheduler pause should never be integrated in one huge
+        # numerical step. The flight controller's own dt guard normally prevents
+        # this, and this additional bound protects the DIMD-only filter.
+        dt = min(dt, 0.05)
+        substeps = max(1, int(math.ceil(dt / self.max_integration_step_s)))
+        h = dt / float(substeps)
+
+        x1 = float(self.state_position)
+        x2 = float(self.state_rate)
+
+        # RK4 integration with piecewise-constant input during this control step.
+        # This is cheap arithmetic only: no trig/coefficient redesign per sample.
+        for _ in range(substeps):
+            k1_1, k1_2 = self._derivative(x1, x2, value)
+            k2_1, k2_2 = self._derivative(
+                x1 + 0.5 * h * k1_1,
+                x2 + 0.5 * h * k1_2,
+                value,
+            )
+            k3_1, k3_2 = self._derivative(
+                x1 + 0.5 * h * k2_1,
+                x2 + 0.5 * h * k2_2,
+                value,
+            )
+            k4_1, k4_2 = self._derivative(
+                x1 + h * k3_1,
+                x2 + h * k3_2,
+                value,
+            )
+
+            x1 += (h / 6.0) * (k1_1 + 2.0 * k2_1 + 2.0 * k3_1 + k4_1)
+            x2 += (h / 6.0) * (k1_2 + 2.0 * k2_2 + 2.0 * k3_2 + k4_2)
+
+        if not (math.isfinite(x1) and math.isfinite(x2)):
+            self.reset()
+            return 0.0
+
+        self.state_position = x1
+        self.state_rate = x2
+        return float(x2)
 
 
 class ManualDroneController(Node):
@@ -283,6 +319,15 @@ class ManualDroneController(Node):
         self.get_logger().warn(
             "DRY RUN is %s. Remove propellers before changing signs, mixer, or channel order."
             % ("ON" if self.dry_run else "OFF")
+        )
+        self.get_logger().info(
+            "Scheduler guards: live QoS depth=1, IMU diagnostics=%.1f Hz, "
+            "control diagnostics=%.1f Hz, DIMD pair-stale cutoff=%.1f ms"
+            % (
+                1.0 / self.imu_diagnostics_period_s,
+                1.0 / self.control_diagnostics_period_s,
+                1000.0 * self.dimd_data_stale_timeout_s,
+            )
         )
 
     # ------------------------------------------------------------------
@@ -376,7 +421,10 @@ class ManualDroneController(Node):
             # orientation, as in the present aircraft.
             # --------------------------------------------------------------
             "dimd_enabled": False,
+            # Legacy secondary timeout is kept for compatibility, but transient
+            # callback/pair staleness is no longer treated as a sensor-health fault.
             "dimd_secondary_timeout_s": 0.05,
+            "dimd_data_stale_timeout_s": 0.020,
             "dimd_max_pair_skew_s": 0.005,
             # Secondary-IMU health/fallback protection. Any invalid sample causes
             # immediate fallback to primary/app2-only control. Recovery is
@@ -387,6 +435,11 @@ class ManualDroneController(Node):
             "dimd_health_recovery_hold_s": 0.50,
             "dimd_health_recovery_min_samples": 50,
             "dimd_health_publish_period_s": 0.10,
+            # High-rate observer topics are diagnostics only. Publishing them at
+            # 100 Hz is enough for a ~9.3 Hz structural mode and avoids flooding
+            # the Python executor with thousands of reliable publishes per second.
+            "imu_diagnostics_period_s": 0.010,
+            "control_diagnostics_period_s": 0.010,
             "dimd_secondary_to_primary_rotation_matrix_flat": [
                 1.0, 0.0, 0.0,
                 0.0, 1.0, 0.0,
@@ -488,6 +541,9 @@ class ManualDroneController(Node):
         self.dimd_secondary_timeout_s = max(
             0.001, float(self._p("dimd_secondary_timeout_s"))
         )
+        self.dimd_data_stale_timeout_s = max(
+            0.002, float(self._p("dimd_data_stale_timeout_s"))
+        )
         self.dimd_max_pair_skew_s = max(
             0.0, float(self._p("dimd_max_pair_skew_s"))
         )
@@ -509,6 +565,12 @@ class ManualDroneController(Node):
         )
         self.dimd_health_publish_period_s = max(
             0.02, float(self._p("dimd_health_publish_period_s"))
+        )
+        self.imu_diagnostics_period_s = max(
+            0.002, float(self._p("imu_diagnostics_period_s"))
+        )
+        self.control_diagnostics_period_s = max(
+            0.002, float(self._p("control_diagnostics_period_s"))
         )
         dimd_rotation_flat = np.asarray(
             self._p("dimd_secondary_to_primary_rotation_matrix_flat"), dtype=float
@@ -560,10 +622,20 @@ class ManualDroneController(Node):
             ) from exc
 
     def _create_ros_entities(self) -> None:
-        qos_best_effort = QoSProfile(
+        # Live flight-control subscriptions should consume the newest sample,
+        # not work through an old Python callback backlog. KEEP_LAST depth=1 is
+        # therefore intentional for RC and both IMUs.
+        qos_latest_best_effort = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
-            depth=5,
+            depth=1,
+        )
+        # Numeric diagnostics are observational only; best-effort depth=1 avoids
+        # reliable-publisher backpressure competing with the flight-control loop.
+        qos_diag = QoSProfile(
+            reliability=QoSReliabilityPolicy.BEST_EFFORT,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1,
         )
         qos_reliable = QoSProfile(
             reliability=QoSReliabilityPolicy.RELIABLE,
@@ -573,12 +645,12 @@ class ManualDroneController(Node):
 
         self.dshot_pub = self.create_publisher(self.dshot_msg_type, self.dshot_topic, 10)
         self.rc_sub = self.create_subscription(
-            self.rc_msg_type, self.rc_topic, self._rc_callback, qos_best_effort
+            self.rc_msg_type, self.rc_topic, self._rc_callback, qos_latest_best_effort
         )
 
         # Primary/original IMU. This remains the existing flight-control path.
         self.imu_sub = self.create_subscription(
-            Imu, self.imu_topic, self._imu_callback, qos_best_effort
+            Imu, self.imu_topic, self._imu_callback, qos_latest_best_effort
         )
 
         # Secondary/new IMU. It feeds the optional DIMD structural branch, but
@@ -587,54 +659,54 @@ class ManualDroneController(Node):
             Imu,
             self.secondary_imu_topic,
             self._secondary_imu_callback,
-            qos_best_effort,
+            qos_latest_best_effort,
         )
 
         # Existing diagnostics: keep names and meaning unchanged (primary IMU).
         self.imu_angle_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/imu_angle_deg", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/imu_angle_deg", qos_diag
         )
         self.imu_gyro_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/imu_gyro_rad_s", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/imu_gyro_rad_s", qos_diag
         )
 
         # New observer diagnostics for the second IMU and the IMU pair.
         self.secondary_imu_angle_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/secondary_imu_angle_deg", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/secondary_imu_angle_deg", qos_diag
         )
         self.secondary_imu_gyro_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/secondary_imu_gyro_rad_s", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/secondary_imu_gyro_rad_s", qos_diag
         )
         self.imu_common_gyro_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/imu_common_gyro_rad_s", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/imu_common_gyro_rad_s", qos_diag
         )
         self.imu_diff_gyro_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/imu_diff_gyro_rad_s", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/imu_diff_gyro_rad_s", qos_diag
         )
         self.imu_relative_angle_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/imu_relative_angle_deg", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/imu_relative_angle_deg", qos_diag
         )
 
         # DIMD diagnostics. Existing diagnostic topic names above are unchanged.
         self.dimd_secondary_aligned_pub = self.create_publisher(
             Vector3,
             f"{self.diagnostics_prefix}/dimd_secondary_gyro_aligned_rad_s",
-            qos_reliable,
+            qos_diag,
         )
         self.dimd_residual_raw_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/dimd_residual_raw_rad_s", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/dimd_residual_raw_rad_s", qos_diag
         )
         self.dimd_modal_rate_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/dimd_modal_rate_rad_s", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/dimd_modal_rate_rad_s", qos_diag
         )
         self.dimd_torque_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/dimd_torque_command", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/dimd_torque_command", qos_diag
         )
         self.base_torque_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/torque_base_command", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/torque_base_command", qos_diag
         )
         self.dimd_active_pub = self.create_publisher(
-            Bool, f"{self.diagnostics_prefix}/dimd_active", qos_reliable
+            Bool, f"{self.diagnostics_prefix}/dimd_active", qos_diag
         )
         self.dimd_secondary_healthy_pub = self.create_publisher(
             Bool, f"{self.diagnostics_prefix}/dimd_secondary_healthy", qos_reliable
@@ -645,15 +717,21 @@ class ManualDroneController(Node):
         self.dimd_health_reason_pub = self.create_publisher(
             String, f"{self.diagnostics_prefix}/dimd_health_reason", qos_reliable
         )
+        self.dimd_data_fresh_pub = self.create_publisher(
+            Bool, f"{self.diagnostics_prefix}/dimd_data_fresh", qos_reliable
+        )
+        self.dimd_inhibit_reason_pub = self.create_publisher(
+            String, f"{self.diagnostics_prefix}/dimd_inhibit_reason", qos_reliable
+        )
 
         self.torque_pub = self.create_publisher(
-            Vector3, f"{self.diagnostics_prefix}/torque_command", qos_reliable
+            Vector3, f"{self.diagnostics_prefix}/torque_command", qos_diag
         )
         self.motor_pwm_pub = self.create_publisher(
-            Float64MultiArray, f"{self.diagnostics_prefix}/motor_pwm_us", qos_reliable
+            Float64MultiArray, f"{self.diagnostics_prefix}/motor_pwm_us", qos_diag
         )
         self.motor_dshot_pub = self.create_publisher(
-            Float64MultiArray, f"{self.diagnostics_prefix}/motor_dshot", qos_reliable
+            Float64MultiArray, f"{self.diagnostics_prefix}/motor_dshot", qos_diag
         )
         self.armed_pub = self.create_publisher(
             Bool, f"{self.diagnostics_prefix}/armed", qos_reliable
@@ -712,6 +790,32 @@ class ManualDroneController(Node):
         self.dimd_secondary_fault_count = 0
         self.last_dimd_health_publish_time = 0.0
 
+        # Payload health and data freshness are deliberately separate. A bad
+        # app1 payload is a real sensor-health fault and uses slow recovery. A
+        # transient Python callback/pair gap only inhibits DIMD torque until new
+        # matched data arrives; it does NOT mark the sensor unhealthy.
+        self.dimd_data_fresh = False
+        self.dimd_inhibit_reason = "startup"
+        self.dimd_stale_event_count = 0
+
+        # Diagnostic publishing is throttled independently of sensor callbacks.
+        self.last_imu_diagnostics_publish_time = 0.0
+        self.last_control_diagnostics_publish_time = 0.0
+
+        # DIMD timestamp pairing state.
+        #
+        # These buffers contain gyro vectors AFTER the exact existing FLU -> FRD
+        # conversion. They do not redefine axes or change the app2 flight-control
+        # path. Pairing work is intentionally tiny so IMU callbacks stay light.
+        self.dimd_primary_pair_buffer: list[tuple[float, np.ndarray]] = []
+        self.dimd_secondary_pair_buffer: list[tuple[float, np.ndarray]] = []
+        self.dimd_pair_buffer_limit = 16
+        self.last_dimd_primary_queued_stamp_s = 0.0
+        self.last_dimd_secondary_queued_stamp_s = 0.0
+        self.last_dimd_pair_stamp_s = 0.0
+        self.last_dimd_pair_wall_time = 0.0
+        self.last_dimd_pair_skew_s = 0.0
+
         # Pair observer outputs, all expressed in the existing FRD body frame.
         self.imu_common_gyro = np.zeros(3, dtype=float)
         self.imu_diff_gyro = np.zeros(3, dtype=float)
@@ -757,18 +861,19 @@ class ManualDroneController(Node):
             self.rate_error_deadband,
         )
 
-        # One independent second-order band-pass per FRD axis. A placeholder
-        # center frequency is used internally when f0<=0 only so the objects can
-        # exist; _compute_dimd_torque() inhibits auxiliary torque until a real
-        # positive f0 is configured.
+        # One independent DIMD band-pass per existing FRD axis.
+        #
+        # IMPORTANT:
+        # - no filter work is done inside either high-rate IMU callback;
+        # - the filter is advanced only in the control loop using its REAL dt;
+        # - the original/app2 controller remains unchanged.
         filter_center = (
             self.dimd_center_frequency_hz
             if self.dimd_center_frequency_hz > 0.0
             else 1.0
         )
         self.dimd_filters = [
-            BiquadBandPass(
-                self.control_frequency_hz,
+            ContinuousBandPass(
                 filter_center,
                 self.dimd_bandwidth_hz,
             )
@@ -878,10 +983,18 @@ class ManualDroneController(Node):
             self.gyro = gyro_raw * self.gyro_signs
             self.last_imu_time = self._now_seconds()
             self.primary_imu_stamp_s = self._message_stamp_seconds(message)
-            self._publish_imu_diagnostics()
 
-            # Observer update only. Does not feed anything back into control.
-            self._update_dual_imu_observer()
+            # DIMD pairing only: queue the already-converted FRD gyro.
+            # No filtering is performed in this high-rate callback.
+            self._queue_dimd_pair_sample(
+                is_primary=True,
+                stamp_s=self.primary_imu_stamp_s,
+                gyro_frd=self.gyro,
+            )
+
+            # Observer/diagnostic publishing is throttled so high-rate EtherCAT
+            # IMU callbacks cannot starve the control timer.
+            self._maybe_publish_imu_observer_diagnostics(self.last_imu_time)
 
     def _secondary_imu_callback(self, message: Imu) -> None:
         """New IMU callback for diagnostics and optional DIMD damping.
@@ -978,9 +1091,161 @@ class ManualDroneController(Node):
                 float(self.secondary_relative_euler[2])
             )
 
-            self._publish_secondary_imu_diagnostics()
-            self._update_dual_imu_observer()
+            # DIMD pairing only: queue the healthy, already-converted FRD gyro.
+            # No band-pass calculation runs in this callback.
+            self._queue_dimd_pair_sample(
+                is_primary=False,
+                stamp_s=self.secondary_imu_stamp_s,
+                gyro_frd=self.secondary_gyro,
+            )
+
+            self._maybe_publish_imu_observer_diagnostics(now)
             self._publish_dimd_health_diagnostics(now)
+
+    def _queue_dimd_pair_sample(
+        self,
+        *,
+        is_primary: bool,
+        stamp_s: float,
+        gyro_frd: np.ndarray,
+    ) -> None:
+        """Queue one already-converted FRD gyro sample for lightweight pairing."""
+        stamp = float(stamp_s)
+        if stamp <= 0.0 or not math.isfinite(stamp):
+            return
+
+        if is_primary:
+            if (
+                self.last_dimd_primary_queued_stamp_s > 0.0
+                and abs(stamp - self.last_dimd_primary_queued_stamp_s) <= 1.0e-9
+            ):
+                return
+            self.last_dimd_primary_queued_stamp_s = stamp
+            buffer = self.dimd_primary_pair_buffer
+        else:
+            if (
+                self.last_dimd_secondary_queued_stamp_s > 0.0
+                and abs(stamp - self.last_dimd_secondary_queued_stamp_s) <= 1.0e-9
+            ):
+                return
+            self.last_dimd_secondary_queued_stamp_s = stamp
+            buffer = self.dimd_secondary_pair_buffer
+
+        buffer.append((stamp, np.asarray(gyro_frd, dtype=float).copy()))
+        if len(buffer) > self.dimd_pair_buffer_limit:
+            del buffer[0 : len(buffer) - self.dimd_pair_buffer_limit]
+
+        self._try_match_dimd_pair()
+
+    def _try_match_dimd_pair(self) -> None:
+        """Match the oldest app1/app2 samples without doing any filtering.
+
+        The previous implementation compared the two most recently executed ROS
+        callbacks, which can be several samples apart even when true matching
+        source timestamps exist. This routine instead works on small time-ordered
+        buffers.
+
+        If one stream missed a sample, the nearer of the next two candidates is
+        preferred before accepting a pair within the configured tolerance.
+        """
+        tolerance = float(self.dimd_max_pair_skew_s)
+
+        while self.dimd_primary_pair_buffer and self.dimd_secondary_pair_buffer:
+            primary_stamp, primary_gyro = self.dimd_primary_pair_buffer[0]
+            secondary_stamp, secondary_gyro = self.dimd_secondary_pair_buffer[0]
+            skew = float(secondary_stamp - primary_stamp)
+
+            if abs(skew) <= tolerance:
+                # Do not let one missing frame shift all subsequent pairings by
+                # one sample. Prefer the closer next candidate when available.
+                if (
+                    primary_stamp < secondary_stamp
+                    and len(self.dimd_primary_pair_buffer) > 1
+                ):
+                    next_primary_stamp = self.dimd_primary_pair_buffer[1][0]
+                    if abs(secondary_stamp - next_primary_stamp) < abs(skew):
+                        del self.dimd_primary_pair_buffer[0]
+                        continue
+
+                if (
+                    secondary_stamp < primary_stamp
+                    and len(self.dimd_secondary_pair_buffer) > 1
+                ):
+                    next_secondary_stamp = self.dimd_secondary_pair_buffer[1][0]
+                    if abs(next_secondary_stamp - primary_stamp) < abs(skew):
+                        del self.dimd_secondary_pair_buffer[0]
+                        continue
+
+                del self.dimd_primary_pair_buffer[0]
+                del self.dimd_secondary_pair_buffer[0]
+                self._accept_dimd_matched_pair(
+                    primary_stamp,
+                    primary_gyro,
+                    secondary_stamp,
+                    secondary_gyro,
+                )
+                continue
+
+            # The earlier sample cannot match the later buffer front within the
+            # allowed window, so discard only that stale unmatched sample.
+            if primary_stamp < secondary_stamp:
+                del self.dimd_primary_pair_buffer[0]
+            else:
+                del self.dimd_secondary_pair_buffer[0]
+
+    def _accept_dimd_matched_pair(
+        self,
+        primary_stamp_s: float,
+        primary_gyro_frd: np.ndarray,
+        secondary_stamp_s: float,
+        secondary_gyro_frd: np.ndarray,
+    ) -> None:
+        """Store one matched residual; deliberately do NOT filter it here."""
+        pair_stamp = 0.5 * (float(primary_stamp_s) + float(secondary_stamp_s))
+        if (
+            self.last_dimd_pair_stamp_s > 0.0
+            and pair_stamp <= self.last_dimd_pair_stamp_s + 1.0e-9
+        ):
+            return
+
+        aligned_secondary = (
+            self.dimd_secondary_to_primary_rotation
+            @ np.asarray(secondary_gyro_frd, dtype=float)
+        )
+        primary = np.asarray(primary_gyro_frd, dtype=float)
+
+        self.dimd_secondary_gyro_aligned = aligned_secondary
+        self.dimd_residual_raw = aligned_secondary - primary
+        self.last_dimd_pair_stamp_s = pair_stamp
+        now = self._now_seconds()
+        self.last_dimd_pair_wall_time = now
+        self.last_dimd_pair_skew_s = abs(
+            float(secondary_stamp_s) - float(primary_stamp_s)
+        )
+        self._set_dimd_data_fresh(now)
+
+    def _maybe_publish_imu_observer_diagnostics(self, now: float) -> None:
+        """Publish observer-only IMU diagnostics at a bounded rate.
+
+        The EtherCAT publishers can run far faster than Python can usefully
+        publish diagnostics. Keeping these publishes out of every sensor callback
+        substantially reduces executor contention without changing any control
+        state, coordinate convention, or DIMD residual pairing.
+        """
+        if (
+            self.last_imu_diagnostics_publish_time > 0.0
+            and (now - self.last_imu_diagnostics_publish_time)
+            < self.imu_diagnostics_period_s
+        ):
+            return
+        self.last_imu_diagnostics_publish_time = now
+
+        if self.imu_initialized:
+            self._publish_imu_diagnostics()
+        if self.secondary_imu_initialized:
+            self._publish_secondary_imu_diagnostics()
+        if self.imu_initialized and self.secondary_imu_initialized:
+            self._update_dual_imu_observer()
 
     def _update_dual_imu_observer(self) -> None:
         """Compute observer-only quantities after both IMUs are valid.
@@ -1006,13 +1271,10 @@ class ManualDroneController(Node):
         # EXISTING diagnostic meaning is preserved exactly.
         self.imu_diff_gyro = self.secondary_gyro - self.gyro
 
-        # DIMD uses a separate optional calibration matrix AFTER both IMUs have
-        # already been converted with the existing FLU -> FRD signs. The default
-        # matrix is identity, so no coordinate-system definition is changed.
-        self.dimd_secondary_gyro_aligned = (
-            self.dimd_secondary_to_primary_rotation @ self.secondary_gyro
-        )
-        self.dimd_residual_raw = self.dimd_secondary_gyro_aligned - self.gyro
+        # DIMD aligned/residual signals are NOT formed from the two "latest
+        # callback" values here. They are updated only from source-timestamp-
+        # matched samples in _accept_dimd_matched_pair(). This prevents callback
+        # scheduling order from masquerading as sensor timing error.
 
         # Relative orientation between the two IMU-bearing rods.
         # Both q's have already undergone the SAME FLU -> FRD conversion.
@@ -1074,6 +1336,39 @@ class ManualDroneController(Node):
 
         return True, "ok"
 
+    def _set_dimd_data_stale(self, reason: str, now: float) -> None:
+        """Inhibit DIMD on stale scheduling/data without declaring app1 unhealthy."""
+        reason = str(reason)
+        transition = self.dimd_data_fresh or self.dimd_inhibit_reason != reason
+        self.dimd_data_fresh = False
+        self.dimd_inhibit_reason = reason
+
+        if transition:
+            self.dimd_stale_event_count += 1
+            # Drop DIMD memory/torque once on the transition. The original app2
+            # controller is untouched. No 0.5 s sensor-health recovery is started.
+            self._reset_dimd_state()
+            self.get_logger().info(
+                "DIMD data temporarily stale (%s); auxiliary torque forced to zero "
+                "without marking secondary IMU unhealthy" % reason
+            )
+            self._publish_dimd_health_diagnostics(now, force=True)
+
+    def _set_dimd_data_fresh(self, now: float) -> None:
+        """Mark matched DIMD data fresh; re-entry uses the existing soft ramp."""
+        if self.dimd_data_fresh and self.dimd_inhibit_reason == "ok":
+            return
+        was_stale = not self.dimd_data_fresh
+        self.dimd_data_fresh = True
+        self.dimd_inhibit_reason = "ok"
+        if was_stale:
+            self.get_logger().info(
+                "DIMD matched data fresh again; DIMD may re-enter immediately "
+                "with %.3f s ramp (secondary health unchanged)"
+                % self.dimd_ramp_time_s
+            )
+            self._publish_dimd_health_diagnostics(now, force=True)
+
     def _set_secondary_health_fault(self, reason: str, now: float) -> None:
         was_healthy = self.dimd_secondary_healthy
         old_reason = self.dimd_secondary_health_reason
@@ -1082,6 +1377,8 @@ class ManualDroneController(Node):
 
         self.dimd_secondary_healthy = False
         self.dimd_secondary_health_reason = str(reason)
+        self.dimd_data_fresh = False
+        self.dimd_inhibit_reason = "secondary_unhealthy"
         self.dimd_secondary_recovery_start_time = 0.0
         self.dimd_secondary_recovery_samples = 0
 
@@ -1093,6 +1390,13 @@ class ManualDroneController(Node):
         # Immediately remove all DIMD memory/torque. Base app2 flight control is
         # untouched and continues in the same control-loop iteration.
         self._reset_dimd_state()
+        self.dimd_primary_pair_buffer.clear()
+        self.dimd_secondary_pair_buffer.clear()
+        self.last_dimd_primary_queued_stamp_s = 0.0
+        self.last_dimd_secondary_queued_stamp_s = 0.0
+        self.last_dimd_pair_stamp_s = 0.0
+        self.last_dimd_pair_wall_time = 0.0
+        self.last_dimd_pair_skew_s = 0.0
 
         log = self.get_logger().warn if self.dimd_enabled else self.get_logger().info
         log(
@@ -1158,13 +1462,22 @@ class ManualDroneController(Node):
 
         fallback_msg = Bool()
         fallback_msg.data = bool(
-            self.dimd_enabled and not self.dimd_secondary_healthy
+            self.dimd_enabled
+            and (not self.dimd_secondary_healthy or not self.dimd_data_fresh)
         )
         self.dimd_fallback_pub.publish(fallback_msg)
 
         reason_msg = String()
         reason_msg.data = str(self.dimd_secondary_health_reason)
         self.dimd_health_reason_pub.publish(reason_msg)
+
+        fresh_msg = Bool()
+        fresh_msg.data = bool(self.dimd_data_fresh)
+        self.dimd_data_fresh_pub.publish(fresh_msg)
+
+        inhibit_msg = String()
+        inhibit_msg.data = str(self.dimd_inhibit_reason)
+        self.dimd_inhibit_reason_pub.publish(inhibit_msg)
 
     def _reset_zero_callback(
         self, _request: Trigger.Request, response: Trigger.Response
@@ -1261,34 +1574,38 @@ class ManualDroneController(Node):
 
     def _dimd_inputs_valid(self, now: float) -> bool:
         if not self.imu_initialized or not self.secondary_imu_initialized:
-            return False
-        if not self.secondary_sample_valid or not self.dimd_secondary_healthy:
-            return False
-        if self.last_secondary_imu_time <= 0.0:
-            return False
-        if (now - self.last_secondary_imu_time) > self.dimd_secondary_timeout_s:
-            self._set_secondary_health_fault("secondary_timeout", now)
+            self.dimd_inhibit_reason = "waiting_for_imu_initialization"
             return False
 
-        # Source timestamps are used for pair synchronization. A bad pair does
-        # not disarm the aircraft; it immediately drops only the DIMD branch.
-        if self.primary_imu_stamp_s > 0.0 and self.secondary_imu_stamp_s > 0.0:
-            if (
-                abs(self.primary_imu_stamp_s - self.secondary_imu_stamp_s)
-                > self.dimd_max_pair_skew_s
-            ):
-                self._set_secondary_health_fault("imu_pair_timestamp_skew", now)
-                return False
+        # A real invalid payload is still a genuine health fault and retains the
+        # fail-fast / recover-slow protection. Scheduler delays are NOT health.
+        if not self.secondary_sample_valid or not self.dimd_secondary_healthy:
+            self.dimd_inhibit_reason = "secondary_unhealthy"
+            return False
+
+        # DIMD control authority depends on a recent genuinely matched pair.
+        # If Python scheduling pauses, cut ONLY the auxiliary DIMD torque after
+        # a short stale window. Do not start the 0.5 s health-recovery timer.
+        if self.last_dimd_pair_wall_time <= 0.0:
+            self._set_dimd_data_stale("waiting_for_matched_pair", now)
+            return False
+
+        pair_age = now - self.last_dimd_pair_wall_time
+        if pair_age > self.dimd_data_stale_timeout_s:
+            self._set_dimd_data_stale("matched_pair_stale", now)
+            return False
+
+        self._set_dimd_data_fresh(now)
         return True
 
     def _compute_dimd_torque(self, now: float, dt: float) -> np.ndarray:
         """Return optional bounded structural damping moment in existing FRD axes.
 
         Simplified two-IMU DIMD branch:
-            secondary gyro (existing FRD)
+            source-timestamp-matched secondary gyro (existing FRD)
               -> optional fixed alignment calibration
-              -> subtract primary/body-reference gyro
-              -> second-order band-pass around measured structural mode
+              -> subtract matched primary/body-reference gyro
+              -> continuous band-pass advanced with actual control-loop dt
               -> signed per-axis gain
               -> per-axis auxiliary moment saturation
 
@@ -1305,7 +1622,9 @@ class ManualDroneController(Node):
             self.dimd_ramp = 0.0
             return self.dimd_torque.copy()
         if not self._dimd_inputs_valid(now):
-            self._reset_dimd_state()
+            self.dimd_torque[:] = 0.0
+            self.dimd_active = False
+            self.dimd_ramp = 0.0
             return self.dimd_torque.copy()
 
         residual = self.dimd_residual_raw.copy()
@@ -1318,8 +1637,14 @@ class ManualDroneController(Node):
                 dtype=float,
             )
 
+        # Advance the continuous-time band-pass using the ACTUAL control-loop dt.
+        # This avoids both the old fixed-1000-Hz assumption and the unsafe
+        # coefficient redesign that was previously attempted inside IMU callbacks.
         self.dimd_modal_rate = np.array(
-            [self.dimd_filters[i].update(float(residual[i])) for i in range(3)],
+            [
+                self.dimd_filters[i].update(float(residual[i]), dt)
+                for i in range(3)
+            ],
             dtype=float,
         )
 
@@ -1467,13 +1792,22 @@ class ManualDroneController(Node):
             self.last_internal_dshot = internal_dshot
 
             self._publish_motor_command(internal_dshot)
-            self._publish_control_diagnostics(
-                torque,
-                self.motor_pwm,
-                internal_dshot,
-                torque_base=torque_base,
-                torque_dimd=torque_dimd,
-            )
+
+            # Control diagnostics are observation only; bound their publication
+            # rate so they cannot compete with DSHOT/control execution.
+            if (
+                self.last_control_diagnostics_publish_time <= 0.0
+                or (now - self.last_control_diagnostics_publish_time)
+                >= self.control_diagnostics_period_s
+            ):
+                self.last_control_diagnostics_publish_time = now
+                self._publish_control_diagnostics(
+                    torque,
+                    self.motor_pwm,
+                    internal_dshot,
+                    torque_base=torque_base,
+                    torque_dimd=torque_dimd,
+                )
             self._log_status(now, roll_target, pitch_target, yaw_rate_target)
 
     # ------------------------------------------------------------------
@@ -1626,7 +1960,7 @@ class ManualDroneController(Node):
         roll, pitch, yaw = [math.degrees(float(v)) for v in self.relative_euler]
         self.get_logger().info(
             "MANUAL | RPY=(%.1f, %.1f, %.1f) deg | target RP=(%.1f, %.1f) deg | "
-            "yaw rate=%.2f rad/s | PWM=%s | DSHOT=%s | DIMD=%s | SEC=%s%s"
+            "yaw rate=%.2f rad/s | PWM=%s | DSHOT=%s | DIMD=%s | SEC=%s | DATA=%s%s"
             % (
                 roll,
                 pitch,
@@ -1638,6 +1972,7 @@ class ManualDroneController(Node):
                 self.last_internal_dshot.tolist(),
                 "ACTIVE" if self.dimd_active else "OFF",
                 "HEALTHY" if self.dimd_secondary_healthy else self.dimd_secondary_health_reason,
+                "FRESH" if self.dimd_data_fresh else self.dimd_inhibit_reason,
                 " | DRY_RUN" if self.dry_run else "",
             )
         )

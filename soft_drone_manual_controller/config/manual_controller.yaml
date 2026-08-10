@@ -144,11 +144,11 @@ soft_drone_manual_controller:
     # Signed mapping: filtered structural-rate xyz -> auxiliary roll/pitch/yaw
     # torque. Start from zero. After determining the correct sign, increase one
     # axis at a time. Do NOT copy gains/frequencies from another aircraft/paper.
-    dimd_gain_xyz: [0.0, 0.0, 0.0]
+    dimd_gain_xyz: [0.0, 0.06, 0.0]
 
     # Independent auxiliary torque limits. These are deliberately much smaller
     # than the existing base-controller torque limits above.
-    dimd_torque_limit_xyz: [0.02, 0.02, 0.02]
+    dimd_torque_limit_xyz: [0.0, 0.005, 0.0]
     dimd_residual_deadband_rad_s: 0.0
     dimd_ramp_time_s: 1.0
 
