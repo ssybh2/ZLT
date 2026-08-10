@@ -11,7 +11,8 @@ Dual-IMU / simplified DIMD addition:
   primary RC/IMU failsafe.
 - Secondary/new IMU: /ecat/sn2883658/app1/read
   Adds a separate structural-vibration damping branch inspired by DIMD:
-      aligned secondary gyro - primary gyro -> band-pass -> bounded auxiliary torque
+      aligned secondary gyro - primary gyro -> band-pass -> phase compensation
+      -> bounded auxiliary torque
   The auxiliary torque is added AFTER the original attitude/rate controller and
   BEFORE the existing motor mixer. If the secondary IMU is stale, unsynchronized,
   or has an invalid payload, the auxiliary torque becomes zero immediately and the
@@ -284,6 +285,20 @@ class ContinuousBandPass:
         self.state_rate = x2
         return float(x2)
 
+    def quadrature_lag_output(self) -> float:
+        """Return the approximately -90 degree quadrature component near f0.
+
+        The continuous filter states satisfy state_position' = state_rate.
+        Therefore, for a narrow-band sinusoid at omega ~= omega0,
+
+            omega0 * state_position ~= -j * state_rate
+
+        so this quantity lags the existing band-pass output by about 90 degrees.
+        It is used only for DIMD temporal phase compensation; it does not alter
+        either IMU coordinate system or the matched residual definition.
+        """
+        return float(self.omega0 * self.state_position)
+
 
 class ManualDroneController(Node):
     def __init__(self) -> None:
@@ -307,12 +322,14 @@ class ManualDroneController(Node):
             % (self.imu_topic, self.secondary_imu_topic)
         )
         self.get_logger().info(
-            "DIMD control is %s; f0=%.3f Hz, BW=%.3f Hz, gain=%s, limit=%s"
+            "DIMD control is %s; f0=%.3f Hz, BW=%.3f Hz, gain=%s, "
+            "phase_lead_deg=%s, limit=%s"
             % (
                 "ENABLED" if self.dimd_enabled else "DISABLED",
                 self.dimd_center_frequency_hz,
                 self.dimd_bandwidth_hz,
                 self.dimd_gain.tolist(),
+                self.dimd_phase_lead_deg.tolist(),
                 self.dimd_torque_limit.tolist(),
             )
         )
@@ -449,10 +466,13 @@ class ManualDroneController(Node):
             # f0 <= 0 intentionally inhibits auxiliary torque.
             "dimd_center_frequency_hz": 0.0,
             "dimd_bandwidth_hz": 2.0,
-            # Signed gains map filtered structural-rate components directly to
-            # roll/pitch/yaw auxiliary moments. Start at zero and determine the
-            # sign with propellers removed / dry-run first.
+            # Signed gains map the phase-compensated structural-rate signal to
+            # roll/pitch/yaw auxiliary moments.
             "dimd_gain_xyz": [0.0, 0.0, 0.0],
+            # TEMPORAL control-phase adjustment near the identified center
+            # frequency. This is NOT an IMU-frame rotation. 0 deg reproduces the
+            # previous controller; +90/-90 use the filter's quadrature state.
+            "dimd_phase_lead_deg_xyz": [0.0, 0.0, 0.0],
             "dimd_torque_limit_xyz": [0.02, 0.02, 0.02],
             "dimd_residual_deadband_rad_s": 0.0,
             "dimd_ramp_time_s": 1.0,
@@ -586,9 +606,28 @@ class ManualDroneController(Node):
         self.dimd_center_frequency_hz = float(self._p("dimd_center_frequency_hz"))
         self.dimd_bandwidth_hz = max(1.0e-3, float(self._p("dimd_bandwidth_hz")))
         self.dimd_gain = np.asarray(self._p("dimd_gain_xyz"), dtype=float)
+        self.dimd_phase_lead_deg = np.asarray(
+            self._p("dimd_phase_lead_deg_xyz"), dtype=float
+        )
         self.dimd_torque_limit = np.asarray(self._p("dimd_torque_limit_xyz"), dtype=float)
-        if self.dimd_gain.shape != (3,) or self.dimd_torque_limit.shape != (3,):
-            raise ValueError("dimd_gain_xyz and dimd_torque_limit_xyz must each have 3 values")
+        if (
+            self.dimd_gain.shape != (3,)
+            or self.dimd_phase_lead_deg.shape != (3,)
+            or self.dimd_torque_limit.shape != (3,)
+        ):
+            raise ValueError(
+                "dimd_gain_xyz, dimd_phase_lead_deg_xyz, and "
+                "dimd_torque_limit_xyz must each have 3 values"
+            )
+        if not np.all(np.isfinite(self.dimd_phase_lead_deg)):
+            raise ValueError("dimd_phase_lead_deg_xyz must contain finite values")
+
+        # Precompute trigonometry once at startup so temporal phase compensation
+        # adds only a few multiplies/adds to each control iteration.
+        dimd_phase_rad = np.deg2rad(self.dimd_phase_lead_deg)
+        self.dimd_phase_cos = np.cos(dimd_phase_rad)
+        self.dimd_phase_sin = np.sin(dimd_phase_rad)
+
         self.dimd_torque_limit = np.abs(self.dimd_torque_limit)
         self.dimd_residual_deadband = max(
             0.0, float(self._p("dimd_residual_deadband_rad_s"))
@@ -698,6 +737,9 @@ class ManualDroneController(Node):
         )
         self.dimd_modal_rate_pub = self.create_publisher(
             Vector3, f"{self.diagnostics_prefix}/dimd_modal_rate_rad_s", qos_diag
+        )
+        self.dimd_control_rate_pub = self.create_publisher(
+            Vector3, f"{self.diagnostics_prefix}/dimd_control_rate_rad_s", qos_diag
         )
         self.dimd_torque_pub = self.create_publisher(
             Vector3, f"{self.diagnostics_prefix}/dimd_torque_command", qos_diag
@@ -826,7 +868,11 @@ class ManualDroneController(Node):
         # DIMD branch state. This is separate from the original controller state.
         self.dimd_secondary_gyro_aligned = np.zeros(3, dtype=float)
         self.dimd_residual_raw = np.zeros(3, dtype=float)
+        # Raw band-pass output retained with its old meaning for all historical
+        # rosbag comparisons.
         self.dimd_modal_rate = np.zeros(3, dtype=float)
+        # Phase-compensated signal actually multiplied by dimd_gain.
+        self.dimd_control_rate = np.zeros(3, dtype=float)
         self.dimd_torque = np.zeros(3, dtype=float)
         self.dimd_active = False
         self.dimd_ramp = 0.0
@@ -1568,6 +1614,7 @@ class ManualDroneController(Node):
         for filter_axis in getattr(self, "dimd_filters", []):
             filter_axis.reset()
         self.dimd_modal_rate[:] = 0.0
+        self.dimd_control_rate[:] = 0.0
         self.dimd_torque[:] = 0.0
         self.dimd_active = False
         self.dimd_ramp = 0.0
@@ -1606,6 +1653,7 @@ class ManualDroneController(Node):
               -> optional fixed alignment calibration
               -> subtract matched primary/body-reference gyro
               -> continuous band-pass advanced with actual control-loop dt
+              -> configurable temporal phase compensation near f0
               -> signed per-axis gain
               -> per-axis auxiliary moment saturation
 
@@ -1640,6 +1688,9 @@ class ManualDroneController(Node):
         # Advance the continuous-time band-pass using the ACTUAL control-loop dt.
         # This avoids both the old fixed-1000-Hz assumption and the unsafe
         # coefficient redesign that was previously attempted inside IMU callbacks.
+        #
+        # IMPORTANT: dimd_modal_rate keeps the exact old diagnostic meaning:
+        # unshifted band-pass structural-rate output.
         self.dimd_modal_rate = np.array(
             [
                 self.dimd_filters[i].update(float(residual[i]), dt)
@@ -1648,7 +1699,29 @@ class ManualDroneController(Node):
             dtype=float,
         )
 
-        requested = self.dimd_gain * self.dimd_modal_rate
+        # Temporal phase compensation for the DIMD CONTROL PATH ONLY.
+        #
+        # Near f0:
+        #   in_phase = state_rate                  ~= 0 deg
+        #   lag_90   = omega0 * state_position    ~= -90 deg
+        #
+        # Therefore:
+        #   control = cos(phi)*in_phase - sin(phi)*lag_90
+        #
+        # gives approximately +phi degrees of phase lead at f0.
+        # phi=0 reproduces the previous implementation exactly.
+        #
+        # This does NOT rotate, negate, delay, or otherwise redefine either IMU.
+        dimd_quadrature_lag = np.array(
+            [filter_axis.quadrature_lag_output() for filter_axis in self.dimd_filters],
+            dtype=float,
+        )
+        self.dimd_control_rate = (
+            self.dimd_phase_cos * self.dimd_modal_rate
+            - self.dimd_phase_sin * dimd_quadrature_lag
+        )
+
+        requested = self.dimd_gain * self.dimd_control_rate
         requested = np.clip(
             requested, -self.dimd_torque_limit, self.dimd_torque_limit
         )
@@ -1931,6 +2004,12 @@ class ManualDroneController(Node):
         modal_msg = Vector3()
         modal_msg.x, modal_msg.y, modal_msg.z = [float(v) for v in self.dimd_modal_rate]
         self.dimd_modal_rate_pub.publish(modal_msg)
+
+        control_rate_msg = Vector3()
+        control_rate_msg.x, control_rate_msg.y, control_rate_msg.z = [
+            float(v) for v in self.dimd_control_rate
+        ]
+        self.dimd_control_rate_pub.publish(control_rate_msg)
 
         active_msg = Bool()
         active_msg.data = bool(self.dimd_active)

@@ -14,7 +14,6 @@ soft_drone_manual_controller:
     rc_message_type: custom_msgs/msg/ReadDJIRC
     dshot_message_type: custom_msgs/msg/WriteDSHOT
 
-    # Change these only when your message field names differ.
     rc_left_y_field: left_y
     rc_left_x_field: left_x
     rc_right_x_field: right_x
@@ -32,30 +31,26 @@ soft_drone_manual_controller:
     arm_throttle_max: -0.80
     lock_switch_value: 2
     unlock_switch_values: [1, 3]
-    dshot_lock_value: 0 #48
+    dshot_lock_value: 0
     dshot_unlock_idle_value: 60
 
-    # -------- DJI stick mapping; source assumes normalized [-1, 1] --------
+    # -------- DJI stick mapping --------
     deadzone_roll: 0.03
     deadzone_pitch: 0.03
     deadzone_yaw: 0.03
     deadzone_throttle: 0.05
     invert_right_y: true
     max_roll_pitch_deg: 30.0
-    # Safer extraction default. Original repository used 3.0 (up to 90 deg).
     stick_angle_multiplier: 1.0
     max_manual_yaw_rate_rad_s: 1.0
 
     # -------- Neutral attitude trim --------
-    # Keep the existing primary/original IMU trim definition unchanged.
     roll_trim_deg: 0.0
     pitch_trim_deg: 0.0
 
     # -------- IMU convention: EXISTING definition, DO NOT CHANGE --------
-    # Both IMUs are physically installed in the same direction.
-    # Raw IMU frame:       x forward, y left,  z up   (FLU)
-    # Controller/body:     x forward, y right, z down (FRD)
-    # Therefore BOTH IMUs use exactly the same existing conversion below.
+    # BOTH raw IMUs: x forward, y left, z up (FLU)
+    # Controller/body: x forward, y right, z down (FRD)
     quaternion_signs_wxyz: [1.0, 1.0, -1.0, -1.0]
     gyro_signs_xyz: [1.0, -1.0, -1.0]
 
@@ -64,7 +59,7 @@ soft_drone_manual_controller:
     attitude_time_constant_s: 0.09
 
     # -------- Angular-rate inner loops --------
-    # Unchanged. These loops continue to use ONLY the original/app2 IMU.
+    # Still uses ONLY original/app2 IMU.
     roll_rate_kp: 0.1215
     roll_rate_ki: 0.0
     roll_rate_kd: 0.001
@@ -81,7 +76,6 @@ soft_drone_manual_controller:
     yaw_torque_limit: 1.8
 
     # -------- X-frame motor mixing --------
-    # Rows are motor1..motor4; columns are roll, pitch, yaw.
     mixer_matrix_flat: [-1.0, 1.0, 1.0,
                          1.0,-1.0, 1.0,
                          1.0, 1.0,-1.0,
@@ -94,32 +88,20 @@ soft_drone_manual_controller:
     pwm_max_us: 2000.0
     dshot_min: 48
     dshot_max: 2047
-
-    # Keep your current runtime motor-channel mapping unchanged.
     dshot_channel_order: [1, 0, 2, 3]
 
-    # -------- Simplified two-IMU DIMD structural damping --------
-    # The original app2 attitude/rate controller above is NOT changed.
-    # app1 only adds an auxiliary structural-damping torque AFTER the original
-    # controller and BEFORE the existing mixer. If app1 is stale/unsynchronized,
-    # DIMD torque becomes exactly zero and app2 continues normal flight control.
-    #
-    # IMPORTANT: keep false until you have identified YOUR aircraft's structural
-    # resonance frequency and verified the damping sign with propellers removed.
+    # -------- Simplified two-IMU DIMD structural branch --------
+    # app2 remains the base-flight IMU. app1 only contributes the auxiliary
+    # structural branch. Invalid/stale app1 makes DIMD torque zero; it never
+    # replaces app2 or disarms the aircraft.
     dimd_enabled: true
 
-    # Secondary IMU validity for the auxiliary branch only. A failure here does
-    # NOT disarm the aircraft; it only disables DIMD torque.
+    # Scheduling / source-time pairing
     dimd_secondary_timeout_s: 0.05
+    dimd_data_stale_timeout_s: 0.020
     dimd_max_pair_skew_s: 0.005
 
-    # -------- Secondary-IMU health / automatic fallback --------
-    # Fail fast: any clearly invalid app1 sample immediately forces DIMD torque
-    # to zero, while the original app2 attitude/rate controller keeps flying.
-    # Recover slow: app1 must stay healthy continuously before DIMD can re-enter.
-    # The observed bug has acceleration collapsing to [0,0,0], so acceleration
-    # norm is used as the strongest payload-health discriminator. Zero gyro alone
-    # is NOT treated as a fault because it is valid when the vehicle is stationary.
+    # Secondary-IMU payload health
     dimd_health_accel_min_norm_m_s2: 0.5
     dimd_health_quaternion_norm_min: 0.5
     dimd_health_quaternion_norm_max: 1.5
@@ -127,28 +109,33 @@ soft_drone_manual_controller:
     dimd_health_recovery_min_samples: 50
     dimd_health_publish_period_s: 0.10
 
-    # This is NOT a new coordinate system. Both IMUs first keep the exact existing
-    # FLU -> FRD conversion defined above. This optional calibration matrix is
-    # applied afterwards to secondary gyro only. Because both IMUs are installed
-    # with the same axis direction, keep identity unless a rigid-body gyro
-    # calibration later gives you a measured 3x3 correction matrix.
+    # Diagnostic publish throttles
+    imu_diagnostics_period_s: 0.010
+    control_diagnostics_period_s: 0.010
+
+    # This matrix is a SPATIAL calibration after BOTH IMUs have already been
+    # converted FLU -> FRD. It is NOT the temporal DIMD phase control below.
+    # Both IMUs are physically installed in the same direction, so keep identity.
     dimd_secondary_to_primary_rotation_matrix_flat: [1.0, 0.0, 0.0,
                                                      0.0, 1.0, 0.0,
                                                      0.0, 0.0, 1.0]
 
-    # Set these from rosbag/FFT/PSD of this aircraft. f0 <= 0 intentionally
-    # inhibits the auxiliary torque even if dimd_enabled is accidentally true.
+    # Identified structural band from the present aircraft.
     dimd_center_frequency_hz: 9.3
     dimd_bandwidth_hz: 3.0
 
-    # Signed mapping: filtered structural-rate xyz -> auxiliary roll/pitch/yaw
-    # torque. Start from zero. After determining the correct sign, increase one
-    # axis at a time. Do NOT copy gains/frequencies from another aircraft/paper.
-    dimd_gain_xyz: [0.0, 0.06, 0.0]
+    # SAFE replacement default: observe/record the new phase path first.
+    # Keep zero until you deliberately start a phase-search flight.
+    dimd_gain_xyz: [0.0, 0.01, 0.0]
 
-    # Independent auxiliary torque limits. These are deliberately much smaller
-    # than the existing base-controller torque limits above.
-    dimd_torque_limit_xyz: [0.0, 0.005, 0.0]
+    # NEW: temporal DIMD feedback phase near f0, in degrees.
+    # + value = approximate phase lead; - value = approximate phase lag.
+    # This parameter changes ONLY the DIMD control signal after band-pass.
+    # It does NOT change either IMU frame, axis sign, or timestamp pairing.
+    dimd_phase_lead_deg_xyz: [0.0, 90.0, 0.0]
+
+    # Keep the current auxiliary authority bound unchanged in the replacement.
+    dimd_torque_limit_xyz: [0.0, 0.002, 0.0]
     dimd_residual_deadband_rad_s: 0.0
     dimd_ramp_time_s: 1.0
 
