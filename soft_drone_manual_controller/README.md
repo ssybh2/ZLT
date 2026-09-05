@@ -1,159 +1,122 @@
 # soft_drone_manual_controller
 
-这是从 `ssybh2/soft_drone_controller` 中提炼出的 **ROS 2 手动飞行包**。只保留以下链路：
+这是 ZLT 的 ROS 2 手动飞行控制包。基础控制链保持为：
 
-`DJI 遥控器 → 手动摇杆映射 → 四元数姿态外环 → 角速度 PID 内环 → X 型四电机混控 → DSHOT`
+`DJI RC → 手动摇杆 → 四元数姿态外环 → 角速度 PID → X-frame mixer → DShot`
 
-已删除 `POSITION`、`HOLD`、`PATH`、动捕位置、目标点和路径发布节点。
+当前版本已经接到 **EcatV2 ProductCode 0x06 / 6×HIPNUC IMU** 话题布局，并保留旧代码的主/副 IMU 语义。
 
-## 1. 适用环境
+## 当前话题映射
 
-- ROS 2 Humble（其他 ROS 2 版本通常也能运行）
-- Python 3、NumPy
-- 已经存在的 EtherCAT 驱动和接口消息包
-- 默认接口：
-  - `custom_msgs/msg/ReadDJIRC`
-  - `custom_msgs/msg/WriteDSHOT`
-- 默认话题：
-  - DJI RC：`/ecat/sn2228293/app1/read`
-  - IMU：`/ecat/sn2228293/app2/read`
-  - DSHOT：`/ecat/sn2228293/app3/write`
+| 作用 | 当前话题 | 旧代码对应 |
+|---|---|---|
+| 主 IMU / 飞控 IMU | `/imu/can1/slot1` | `app2/read` |
+| Rod 0 / 原 DIMD 副 IMU | `/imu/can1/slot2` | `app1/read` |
+| Rod 1 | `/imu/can1/slot3` | 新增 |
+| Rod 2 | `/imu/can2/slot1` | 新增 |
+| Rod 3 | `/imu/can2/slot2` | 新增 |
+| Rod 4 | `/imu/can2/slot3` | 新增 |
+| DJI RC | `/dji_rc` | `app3/read` 的语义 |
+| DShot | `/dshot` | `app4/write` 的语义 |
 
-消息类型使用运行时加载，因此你的系统若实际使用 `soft_drone_msgs`，只需要修改 YAML，例如：
+**只有 `/imu/can1/slot1` 参与基础姿态控制、角速度 PID、解锁条件和主 IMU 超时保护。** 其余五个 IMU 只进入结构振动/DIMD 分支，不会替代主 IMU，也不会因为单个 rod IMU 失效而直接让基础飞控上锁。
 
-```yaml
-rc_message_type: soft_drone_msgs/msg/ReadDJIRC
-dshot_message_type: soft_drone_msgs/msg/WriteDSHOT
+## 6-IMU DIMD 扩展
+
+入口脚本现在是：
+
+```text
+soft_drone_manual_controller/manual_controller_6imu.py
 ```
 
-## 2. 安装和编译
+原 `manual_controller.py` 保留不动，作为基础飞控和旧双 IMU DIMD 实现。新文件通过继承扩展出：
 
-把整个文件夹放入 ROS 2 工作空间的 `src`：
+- 1 路主 IMU；
+- 5 路 rod IMU；
+- 每路 rod 相对主 IMU 的时间配对、健康状态、对齐角速度和 residual；
+- 可配置的 `3×15` DIMD 空间投影矩阵；
+- 继续复用原来的 band-pass、phase lead、gain、torque limit、ramp 和 `tau_base + tau_dimd` 控制链。
+
+为了不在更换 EtherCAT 话题的同时改变已经飞过的控制律，默认投影矩阵只选择 **rod0 = `/imu/can1/slot2`**。因此默认 DIMD 控制信号仍等价于旧代码的 `app1 - app2` 路径；其余四个 IMU 已经订阅、时间配对并发布诊断，后续拿到实机模态数据后再修改 `dimd_rod_projection_matrix_flat` 即可真正加入多点模态投影。
+
+每个 rod 的诊断话题为：
+
+```text
+/manual_drone/dimd/rod0/gyro_aligned_rad_s
+/manual_drone/dimd/rod0/residual_rad_s
+/manual_drone/dimd/rod0/healthy
+...
+/manual_drone/dimd/rod4/gyro_aligned_rad_s
+/manual_drone/dimd/rod4/residual_rad_s
+/manual_drone/dimd/rod4/healthy
+```
+
+## EtherCAT 配置
+
+ZLT 的：
+
+```text
+src/soem_bringup/config/config.yaml
+```
+
+已经更新为 ProductCode `0x06` 的 8-task 布局：前 6 个 task 为 IMU，第 7 个为 DJI RC，第 8 个为 DShot。当前 ZLT 从站序列号仍使用 `sn2883658`。
+
+`src/EcatV2_Master` 子模块也改为：
+
+```text
+https://github.com/ssybh2/EcatV2_Master.git
+feature/6imu-rc-dshot-pdo-v006
+```
+
+并固定到当前 ProductCode 0x06 分支版本，避免拉回旧 upstream 代码。
+
+## 拉取与编译
 
 ```bash
-cd ~/your_ros2_ws/src
-unzip soft_drone_manual_controller.zip
-cd ..
-rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install --packages-select soft_drone_manual_controller
+git pull
+git submodule sync --recursive
+git submodule update --init --recursive
+
+colcon build --symlink-install
 source install/setup.bash
 ```
 
-先确认自定义消息已经被当前终端找到：
+确认话题：
 
 ```bash
-ros2 interface show custom_msgs/msg/ReadDJIRC
-ros2 interface show custom_msgs/msg/WriteDSHOT
+ros2 topic list | grep -E 'imu/can|dji_rc|dshot'
+ros2 topic echo /imu/can1/slot1
+ros2 topic echo /imu/can1/slot2
+ros2 topic echo /dji_rc
 ```
 
-## 3. 第一次启动：必须拆桨并使用 dry-run
+第一次验证建议拆桨并使用 dry-run：
 
 ```bash
 ros2 launch soft_drone_manual_controller manual_controller.launch.py dry_run:=true
 ```
 
-查看输入和计算结果：
+然后检查：
 
 ```bash
-ros2 topic echo /ecat/sn2228293/app1/read
-ros2 topic echo /ecat/sn2228293/app2/read
 ros2 topic echo /manual_drone/imu_angle_deg
+ros2 topic echo /manual_drone/dimd/rod0/residual_rad_s
+ros2 topic echo /manual_drone/dimd/rod1/residual_rad_s
 ros2 topic echo /manual_drone/motor_pwm_us
-ros2 topic echo /manual_drone/motor_dshot
 ros2 topic echo /manual_drone/armed
 ```
 
-重新把当前姿态设为零点：
+## 坐标与安装
 
-```bash
-ros2 service call /manual_drone/reset_attitude_zero std_srvs/srv/Trigger {}
-```
-
-节点会拒绝在解锁状态下重置零点。
-
-## 4. DJI 遥控器映射
-
-| DJI 输入 | 手动飞行功能 |
-|---|---|
-| 左摇杆上下 `left_y` | 总油门，假定范围 `[-1, 1]` |
-| 左摇杆左右 `left_x` | Yaw 角速度指令 |
-| 右摇杆左右 `right_x` | Roll 姿态角指令 |
-| 右摇杆上下 `right_y` | Pitch 姿态角指令，默认取反 |
-| 左三段开关位置 `2` | 上锁 |
-| 左三段开关位置 `1` 或 `3` | 解锁并保持 MANUAL |
-| 右三段开关 | 手动包中不参与模式切换，仅保留读取 |
-
-默认增加两项解锁保护：`left_y <= -0.80` 才允许解锁，并且每次启动或超时上锁后，都必须先把左开关拨到锁定位置，再拨回解锁位置。
-
-## 5. 实机输出
-
-确认以下项目全部正确后，才可关闭 dry-run：
-
-1. 拆桨时逐个核对四路电机通道和旋向。
-2. 向右倾斜机身时，控制输出必须产生向左恢复的趋势。
-3. 向前倾斜机身时，控制输出必须产生向后恢复的趋势。
-4. 核对 IMU 四元数符号、角速度符号和右摇杆 Pitch 符号。
-5. 核对 DJI 左开关的实际数值确实是 `1/3=解锁，2=上锁`。
-6. 核对油门最低点是 `-1` 附近。
-
-然后执行：
-
-```bash
-ros2 launch soft_drone_manual_controller manual_controller.launch.py dry_run:=false
-```
-
-也可以直接编辑：
+现有代码继续保留原来的 HIPNUC 转换：
 
 ```text
-config/manual_controller.yaml
+quaternion: [w, x, y, z] -> [w, x, -y, -z]
+gyro:       [x, y, z]    -> [x, -y, -z]
 ```
 
-## 6. 电机通道顺序
+即原始 FLU → 控制器 FRD。新增四个 rod IMU 的固定空间校准矩阵默认都是单位阵；如果实际安装方向不同，先在 `config/manual_controller.yaml` 中修改 `additional_rod_to_primary_rotation_matrices_flat`，不要直接改 PID 或 DIMD gain。
 
-原仓库的内部电机到 DSHOT 通道映射是：
+## 安全说明
 
-```text
-channel1 = motor3
-channel2 = motor1
-channel3 = motor2
-channel4 = motor4
-```
-
-对应 YAML：
-
-```yaml
-dshot_channel_order: [2, 0, 1, 3]
-```
-
-数组使用从 0 开始的内部电机索引。若实机接线不同，只修改此数组，不要先改 PID。
-
-## 7. 与原仓库相比的关键处理
-
-- 保留原仓库最新手动模式的 IMU 符号：四元数 `[w, x, -y, -z]`，角速度 `[x, -y, -z]`。
-- 保留四元数误差姿态外环、角速度内环、混控矩阵、平滑和 DSHOT 映射。
-- 删除位置控制、动捕世界系对齐、Yaw 保持、路径和目标点节点。
-- 自定义消息类型改成运行时参数，解决源代码导入 `custom_msgs`、但 `package.xml` 写成 `soft_drone_msgs` 的不一致。
-- 锁定值 `48` 和解锁怠速值 `120` 作为 **原始 DSHOT 数值**发送，不再错误地先当成 `1000–2000 us PWM` 二次转换。
-- 增加 RC/IMU 超时自动上锁、低油门解锁限制、关机重复发送锁定值和 dry-run。
-- 安全配置默认最大 Roll/Pitch 为 ±30°。原仓库 `_process_stick()` 额外乘以 `3`，会达到 ±90°；需要完全复现时使用 `config/reference_original.yaml`，但仍应先 dry-run。
-
-使用原仓库角度倍率配置：
-
-```bash
-ros2 launch soft_drone_manual_controller manual_controller.launch.py \
-  config:=$(ros2 pkg prefix soft_drone_manual_controller)/share/soft_drone_manual_controller/config/reference_original.yaml \
-  dry_run:=true
-```
-
-## 8. 首次调试优先顺序
-
-不要一开始同时调 PID 和符号。正确顺序是：
-
-1. 遥控器通道数值与方向。
-2. IMU Roll/Pitch/Yaw 与角速度方向。
-3. 四个 DSHOT 通道与电机编号。
-4. Roll/Pitch/Yaw 混控正负号。
-5. 油门范围和悬停点。
-6. 最后再调角速度 PID、姿态时间常数和角度倍率。
-
-> 这是直接驱动旋翼电机的实验控制器。第一次通电、改符号、改混控和改通道顺序时必须拆除螺旋桨，并准备独立断电手段。
+第一次更换 ProductCode、PDO、IMU 符号、DShot 通道、混控符号或 DIMD 投影时请拆除螺旋桨，并准备独立断电方式。先验证 6 路 IMU、RC、DShot 和主 IMU 基础姿态控制，再逐步修改多点 DIMD 投影权重。
