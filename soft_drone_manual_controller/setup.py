@@ -6,7 +6,7 @@ package_name = "soft_drone_manual_controller"
 
 setup(
     name=package_name,
-    version="0.1.0",
+    version="0.2.0",
     packages=[package_name],
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/" + package_name]),
@@ -18,11 +18,11 @@ setup(
     zip_safe=True,
     maintainer="Teddy",
     maintainer_email="noreply@example.com",
-    description="Manual-only DJI RC attitude controller and DSHOT mixer for a ROS 2 quadrotor.",
+    description="Manual DJI RC quadrotor controller with six-IMU structural observer/DIMD support.",
     license="Apache-2.0",
     entry_points={
         "console_scripts": [
-            "manual_controller = soft_drone_manual_controller.manual_controller:main",
+            "manual_controller = soft_drone_manual_controller.manual_controller_6imu:main",
         ],
     },
 )
