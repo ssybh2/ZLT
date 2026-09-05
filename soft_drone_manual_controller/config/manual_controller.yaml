@@ -150,7 +150,7 @@ soft_drone_manual_controller:
     dimd_rod_projection_matrix_flat:
       [1.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0,
        0.0, 1.0, 0.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0,
-       0.0, 0.0, 1.0,  0.0, 0.0, 0.0,  0.0, 0.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0]
+       0.0, 0.0, 1.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0,  0.0, 0.0, 0.0]
     dimd_projection_nonzero_epsilon: 1.0e-9
 
     # Existing identified structural band / tuning retained.
