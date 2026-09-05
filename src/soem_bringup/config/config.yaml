@@ -1,40 +1,104 @@
+# ProductCode 0x06: 6 x HIPNUC IMU + DJI RC/DBUS read + DShot write
+#
+# Historical ZLT mapping carried forward:
+#   old app2 IMU  -> /imu/can1/slot1  (PRIMARY / flight-control IMU)
+#   old app1 IMU  -> /imu/can1/slot2  (rod0 / legacy DIMD secondary)
+#   old app3 read -> /dji_rc
+#   old app4 write-> /dshot
+#
+# S->M layout:
+#   0..125   6 x HIPNUC IMU (21 B each)
+#   126..159 6-IMU/CAN diagnostics (34 B)
+#   160..178 DJI RC/DBUS (18 raw B + 1 online B)
+#   179..191 reserved
+#
+# M->S layout:
+#   0..7     DShot (4 x uint16)
+#   8..79    reserved
+#
+# Keep the six HIPNUC tasks first. ProductCode/eepid must be 0x06.
+#define UNKNOWN_APP_ID 999
+#define DJIRC_APP_ID 1
+#define LK_APP_ID 2
+#define HIPNUC_IMU_CAN_APP_ID 3
+#define DSHOT_APP_ID 4
+#define DJICAN_APP_ID 5
+#define VANILLA_PWM_APP_ID 6
+#define EXTERNAL_PWM_APP_ID 7
+#define MS5837_30BA_APP_ID 8
+#define ADC_APP_ID 9
+#define CAN_PMU_APP_ID 10
+#define CAN_PORT_1 1
+#define CAN_PORT_2 2
+
 slaves:
   - sn2883658:
-      sdo_len: !uint16_t 35
-      task_count: !uint8_t 4
+      sdo_len: !uint16_t 91
+      task_count: !uint8_t 8
       latency_pub_topic: !std::string '/ecat/sn2883658/latency'
-
       tasks:
         - app_1:
             sdowrite_task_type: !uint8_t 3
-            conf_connection_lost_read_action: !uint8_t 0x01
-            pub_topic: !std::string '/ecat/sn2883658/app1/read'
-            pdoread_offset: !uint16_t 0
             sdowrite_can_inst: !uint8_t 1
-            sdowrite_packet1_id: !uint32_t 0x04
-            sdowrite_packet2_id: !uint32_t 0x05
-            sdowrite_packet3_id: !uint32_t 0x06
-            conf_frame_name: !std::string 'imu_link'
+            sdowrite_packet1_id: !uint32_t 1
+            sdowrite_packet2_id: !uint32_t 2
+            sdowrite_packet3_id: !uint32_t 3
+            pdoread_offset: !uint16_t 0
+            pub_topic: !std::string '/imu/can1/slot1'
+            conf_frame_name: !std::string 'imu_can1_slot1'
         - app_2:
             sdowrite_task_type: !uint8_t 3
-            conf_connection_lost_read_action: !uint8_t 0x01
-            pub_topic: !std::string '/ecat/sn2883658/app2/read'
-            pdoread_offset: !uint16_t 21
             sdowrite_can_inst: !uint8_t 1
-            sdowrite_packet1_id: !uint32_t 0x01
-            sdowrite_packet2_id: !uint32_t 0x02
-            sdowrite_packet3_id: !uint32_t 0x03
-            conf_frame_name: !std::string 'imu_link'
+            sdowrite_packet1_id: !uint32_t 4
+            sdowrite_packet2_id: !uint32_t 5
+            sdowrite_packet3_id: !uint32_t 6
+            pdoread_offset: !uint16_t 21
+            pub_topic: !std::string '/imu/can1/slot2'
+            conf_frame_name: !std::string 'imu_can1_slot2'
         - app_3:
-            sdowrite_task_type: !uint8_t 1
-            conf_connection_lost_read_action: !uint8_t 0x01
-            pub_topic: !std::string '/ecat/sn2883658/app3/read'
+            sdowrite_task_type: !uint8_t 3
+            sdowrite_can_inst: !uint8_t 1
+            sdowrite_packet1_id: !uint32_t 7
+            sdowrite_packet2_id: !uint32_t 8
+            sdowrite_packet3_id: !uint32_t 9
             pdoread_offset: !uint16_t 42
+            pub_topic: !std::string '/imu/can1/slot3'
+            conf_frame_name: !std::string 'imu_can1_slot3'
         - app_4:
+            sdowrite_task_type: !uint8_t 3
+            sdowrite_can_inst: !uint8_t 2
+            sdowrite_packet1_id: !uint32_t 1
+            sdowrite_packet2_id: !uint32_t 2
+            sdowrite_packet3_id: !uint32_t 3
+            pdoread_offset: !uint16_t 63
+            pub_topic: !std::string '/imu/can2/slot1'
+            conf_frame_name: !std::string 'imu_can2_slot1'
+        - app_5:
+            sdowrite_task_type: !uint8_t 3
+            sdowrite_can_inst: !uint8_t 2
+            sdowrite_packet1_id: !uint32_t 4
+            sdowrite_packet2_id: !uint32_t 5
+            sdowrite_packet3_id: !uint32_t 6
+            pdoread_offset: !uint16_t 84
+            pub_topic: !std::string '/imu/can2/slot2'
+            conf_frame_name: !std::string 'imu_can2_slot2'
+        - app_6:
+            sdowrite_task_type: !uint8_t 3
+            sdowrite_can_inst: !uint8_t 2
+            sdowrite_packet1_id: !uint32_t 7
+            sdowrite_packet2_id: !uint32_t 8
+            sdowrite_packet3_id: !uint32_t 9
+            pdoread_offset: !uint16_t 105
+            pub_topic: !std::string '/imu/can2/slot3'
+            conf_frame_name: !std::string 'imu_can2_slot3'
+        - app_7:
+            sdowrite_task_type: !uint8_t 1
+            pdoread_offset: !uint16_t 160
+            pub_topic: !std::string '/dji_rc'
+        - app_8:
             sdowrite_task_type: !uint8_t 4
-            sdowrite_connection_lost_write_action: !uint8_t 0x01
-            sub_topic: !std::string '/ecat/sn2883658/app4/write'
-            pdowrite_offset: !uint16_t 0
-            sdowrite_dshot_id: !uint8_t 2
+            sdowrite_connection_lost_write_action: !uint8_t 2
+            sdowrite_dshot_id: !uint8_t 1
             sdowrite_init_value: !uint16_t 0
-
+            pdowrite_offset: !uint16_t 0
+            sub_topic: !std::string '/dshot'
