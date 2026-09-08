@@ -27,7 +27,7 @@ jobs:
             sudo apt-get install -y ffmpeg
           fi
 
-      - name: Convert latest video to optimized GIF
+      - name: Convert latest video to README-friendly GIF
         shell: bash
         run: |
           set -euo pipefail
@@ -41,28 +41,40 @@ jobs:
 
           echo "Using source video: $VIDEO"
 
-          ffmpeg -y -i "$VIDEO" \
-            -vf "fps=10,scale='min(720,iw)':-2:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
-            docs/assets/demo.gif
+          make_gif() {
+            local fps="$1"
+            local width="$2"
+            local colors="$3"
+            local bayer="$4"
 
-          GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
-          echo "First-pass GIF size: $GIF_SIZE bytes"
-
-          if [ "$GIF_SIZE" -gt 8388608 ]; then
-            echo "GIF is larger than 8 MiB; applying stronger compression"
             ffmpeg -y -i "$VIDEO" \
-              -vf "fps=8,scale='min(560,iw)':-2:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=96:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
+              -vf "fps=${fps},scale='min(${width},iw)':-2:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=${colors}:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=${bayer}:diff_mode=rectangle" \
               docs/assets/demo.gif
+          }
+
+          # Keep README media comfortably below GitHub/Camo rendering limits.
+          make_gif 7 520 80 5
+          GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
+          echo "Pass 1: $GIF_SIZE bytes"
+
+          if [ "$GIF_SIZE" -gt 5242880 ]; then
+            make_gif 6 440 64 6
+            GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
+            echo "Pass 2: $GIF_SIZE bytes"
           fi
 
-          GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
-          if [ "$GIF_SIZE" -gt 10485760 ]; then
-            echo "GIF is still large; applying compact fallback"
-            ffmpeg -y -i "$VIDEO" \
-              -vf "fps=6,scale='min(480,iw)':-2:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=64:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=6:diff_mode=rectangle" \
-              docs/assets/demo.gif
+          if [ "$GIF_SIZE" -gt 4194304 ]; then
+            make_gif 5 360 48 6
+            GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
+            echo "Pass 3: $GIF_SIZE bytes"
           fi
 
+          if [ "$GIF_SIZE" -gt 5242880 ]; then
+            echo "Generated GIF is still too large for reliable README rendering: $GIF_SIZE bytes"
+            exit 1
+          fi
+
+          file docs/assets/demo.gif
           ls -lh docs/assets/demo.gif
 
       - name: Commit generated demo GIF
@@ -75,5 +87,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add docs/assets/demo.gif
-          git commit -m "docs: regenerate README demo GIF"
+          git commit -m "docs: regenerate compact README demo GIF"
           git push
