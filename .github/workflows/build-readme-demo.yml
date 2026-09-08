@@ -52,19 +52,19 @@ jobs:
               docs/assets/demo.gif
           }
 
-          # Keep README media comfortably below GitHub/Camo rendering limits.
+          # Keep README media comfortably small for reliable GitHub rendering.
           make_gif 7 520 80 5
           GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
           echo "Pass 1: $GIF_SIZE bytes"
 
           if [ "$GIF_SIZE" -gt 5242880 ]; then
-            make_gif 6 440 64 6
+            make_gif 6 440 64 5
             GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
             echo "Pass 2: $GIF_SIZE bytes"
           fi
 
           if [ "$GIF_SIZE" -gt 4194304 ]; then
-            make_gif 5 360 48 6
+            make_gif 5 360 48 5
             GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
             echo "Pass 3: $GIF_SIZE bytes"
           fi
