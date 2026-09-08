@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/IMU-6x%20HIPNUC-6F42C1" alt="6x HIPNUC IMU">
 </p>
 
-<img src="docs/assets/zlt_hero.jpg" width="820" alt="ZLT quadrotor research platform">
+<img src="docs/assets/4C80261C-0940-48C2-8484-EA1367690EB1.png" width="820" alt="ZLT quadrotor research platform">
 
 </div>
 
