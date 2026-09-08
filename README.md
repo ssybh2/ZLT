@@ -18,7 +18,7 @@
 ## Demo
 
 <div align="center">
-  <img src="docs/assets/demo.gif" width="760" alt="ZLT flight demo">
+  <img src="https://raw.githubusercontent.com/ssybh2/ZLT/main/docs/assets/demo.gif?v=433010a0aae8" width="520" alt="ZLT flight demo">
   <br>
   <sub>Real-flight demo</sub>
 </div>
