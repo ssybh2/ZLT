@@ -1,0 +1,79 @@
+name: Build README demo GIF
+
+on:
+  push:
+    paths:
+      - '.github/workflows/build-readme-demo.yml'
+      - 'docs/assets/*.mov'
+      - 'docs/assets/*.mp4'
+      - 'docs/assets/*.m4v'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-gif:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure ffmpeg is available
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y ffmpeg
+          fi
+
+      - name: Convert latest video to optimized GIF
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VIDEO="$(find docs/assets -maxdepth 1 -type f \( -iname '*.mov' -o -iname '*.mp4' -o -iname '*.m4v' \) -printf '%T@ %p\n' | sort -nr | head -n 1 | cut -d' ' -f2-)"
+
+          if [ -z "$VIDEO" ]; then
+            echo "No MOV/MP4/M4V file found in docs/assets"
+            exit 1
+          fi
+
+          echo "Using source video: $VIDEO"
+
+          ffmpeg -y -i "$VIDEO" \
+            -vf "fps=10,scale='min(720,iw)':-2:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=128:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
+            docs/assets/demo.gif
+
+          GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
+          echo "First-pass GIF size: $GIF_SIZE bytes"
+
+          if [ "$GIF_SIZE" -gt 8388608 ]; then
+            echo "GIF is larger than 8 MiB; applying stronger compression"
+            ffmpeg -y -i "$VIDEO" \
+              -vf "fps=8,scale='min(560,iw)':-2:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=96:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle" \
+              docs/assets/demo.gif
+          fi
+
+          GIF_SIZE="$(stat -c%s docs/assets/demo.gif)"
+          if [ "$GIF_SIZE" -gt 10485760 ]; then
+            echo "GIF is still large; applying compact fallback"
+            ffmpeg -y -i "$VIDEO" \
+              -vf "fps=6,scale='min(480,iw)':-2:flags=lanczos,split[s0][s1];[s0]palettegen=max_colors=64:stats_mode=diff[p];[s1][p]paletteuse=dither=bayer:bayer_scale=6:diff_mode=rectangle" \
+              docs/assets/demo.gif
+          fi
+
+          ls -lh docs/assets/demo.gif
+
+      - name: Commit generated demo GIF
+        run: |
+          if git diff --quiet -- docs/assets/demo.gif; then
+            echo "demo.gif is already up to date"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/assets/demo.gif
+          git commit -m "docs: regenerate README demo GIF"
+          git push
