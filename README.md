@@ -15,6 +15,11 @@
 
 </div>
 
+<div align="center">
+  <strong>Tensegrity + DIMD</strong><br>
+  The tensegrity-inspired airframe provides compliant deformation paths that can absorb and redistribute disturbances. DIMD uses distributed multi-IMU measurements to observe internal structural motion and adds damping action to suppress oscillatory modes, aiming to reduce vibration seen by the main body and improve flight stability.
+</div>
+
 ## Demo
 
 <div align="center">
