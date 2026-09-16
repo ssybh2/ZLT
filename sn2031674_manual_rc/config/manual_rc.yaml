@@ -1,0 +1,37 @@
+sn2031674_manual_rc:
+  ros__parameters:
+    rc_topic: /ecat/sn2031674/app1/read
+    dshot_topic: /ecat/sn2031674/app4/write
+
+    # Start in dry-run. After checking RC values with props removed, launch with
+    # dry_run:=false to actually publish DShot motor commands.
+    dry_run: true
+    control_rate_hz: 100.0
+    rc_timeout_s: 0.30
+
+    # Requested right-switch behavior.
+    # DJI switch encoding: 1=up, 3=middle, 2=bottom.
+    arm_switch_value: 3
+    disarm_switch_value: 1
+    disarm_on_other_switch_positions: true
+    require_arm_edge: true
+    require_low_throttle_to_arm: true
+    arm_throttle_max: -0.90
+
+    # DShot600 values from EcatV2_Master.
+    dshot_disarmed: 0
+    dshot_idle: 48
+    dshot_max: 2047
+    throttle_expo: 1.0
+
+    # ZLT stick mapping is preserved:
+    # throttle = left_y, yaw = left_x, roll = right_x, pitch = -right_y.
+    # throttle_only drives all four motors equally from left_y.
+    # x_open_loop additionally mixes roll/pitch/yaw, but has no IMU stabilization.
+    mode: throttle_only
+    pitch_inverted: true
+    stick_deadzone: 0.03
+    open_loop_mix_gain: 0.25
+
+    # Logical motor [0,1,2,3] -> WriteDSHOT channel1..4.
+    dshot_channel_order: [0, 1, 2, 3]
