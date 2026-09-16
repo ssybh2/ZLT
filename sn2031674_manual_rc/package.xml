@@ -3,7 +3,7 @@
   <name>sn2031674_manual_rc</name>
   <version>0.1.0</version>
   <description>Manual DJI RC to DShot controller for EtherCAT slave sn2031674.</description>
-  <maintainer email="ssybh2@nottingham.edu.cn">Boyang Hu</maintainer>
+  <maintainer email="maintainer@example.com">ssybh2</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
