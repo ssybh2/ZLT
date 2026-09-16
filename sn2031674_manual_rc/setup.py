@@ -14,8 +14,8 @@ setup(
     ],
     install_requires=["setuptools"],
     zip_safe=True,
-    maintainer="Boyang Hu",
-    maintainer_email="ssybh2@nottingham.edu.cn",
+    maintainer="ssybh2",
+    maintainer_email="maintainer@example.com",
     description="Manual DJI RC to DShot controller for EtherCAT slave sn2031674",
     license="Apache-2.0",
     entry_points={
