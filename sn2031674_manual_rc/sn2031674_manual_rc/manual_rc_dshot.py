@@ -42,6 +42,7 @@ class ManualRcDshot(Node):
         self.declare_parameter("dry_run", True)
         self.declare_parameter("control_rate_hz", 100.0)
         self.declare_parameter("rc_timeout_s", 0.30)
+        self.declare_parameter("command_log_period_s", 1.0)
 
         self.declare_parameter("arm_switch_value", 3)
         self.declare_parameter("disarm_switch_value", 1)
@@ -66,6 +67,9 @@ class ManualRcDshot(Node):
         self.dry_run = bool(self.get_parameter("dry_run").value)
         self.control_rate_hz = max(1.0, float(self.get_parameter("control_rate_hz").value))
         self.rc_timeout_s = max(0.02, float(self.get_parameter("rc_timeout_s").value))
+        self.command_log_period_s = max(
+            0.1, float(self.get_parameter("command_log_period_s").value)
+        )
 
         self.arm_switch_value = int(self.get_parameter("arm_switch_value").value)
         self.disarm_switch_value = int(self.get_parameter("disarm_switch_value").value)
@@ -114,6 +118,8 @@ class ManualRcDshot(Node):
         self.rc_online = False
         self.last_rc_time = 0.0
         self.last_right_switch: int | None = None
+        self.last_command_log_time = 0.0
+        self.last_dshot_command = [self.dshot_disarmed] * 4
 
         self.throttle = -1.0
         self.yaw = 0.0
@@ -129,6 +135,9 @@ class ManualRcDshot(Node):
         )
         self.get_logger().info(
             f"ARM right_switch={self.arm_switch_value}, DISARM right_switch={self.disarm_switch_value}"
+        )
+        self.get_logger().info(
+            f"DShot command status will be printed every {self.command_log_period_s:.1f} s"
         )
 
     def _now_s(self) -> float:
@@ -241,6 +250,35 @@ class ManualRcDshot(Node):
         ]
         return [self._norm_to_dshot(v) for v in mixed]
 
+    def _maybe_log_command(self, now: float) -> None:
+        if (
+            self.last_command_log_time > 0.0
+            and (now - self.last_command_log_time) < self.command_log_period_s
+        ):
+            return
+        self.last_command_log_time = now
+        suffix = " (DRY-RUN, not published)" if self.dry_run else ""
+        c1, c2, c3, c4 = self.last_dshot_command
+        self.get_logger().info(
+            "RC->DSHOT | online=%d armed=%d right_switch=%d | "
+            "throttle=%+.3f yaw=%+.3f roll=%+.3f pitch=%+.3f | "
+            "cmd=[%d, %d, %d, %d]%s"
+            % (
+                1 if self.rc_online else 0,
+                1 if self.armed else 0,
+                self.right_switch,
+                self.throttle,
+                self.yaw,
+                self.roll,
+                self.pitch,
+                c1,
+                c2,
+                c3,
+                c4,
+                suffix,
+            )
+        )
+
     def _control_loop(self) -> None:
         now = self._now_s()
         stale = self.last_rc_time <= 0.0 or (now - self.last_rc_time) > self.rc_timeout_s
@@ -249,24 +287,28 @@ class ManualRcDshot(Node):
                 self._disarm("RC timeout")
             else:
                 self._publish_dshot([self.dshot_disarmed] * 4)
+            self._maybe_log_command(now)
             return
 
         if not self.rc_online or not self.armed:
             self._publish_dshot([self.dshot_disarmed] * 4)
+            self._maybe_log_command(now)
             return
 
         self._publish_dshot(self._compute_motor_values())
         self._publish_armed()
+        self._maybe_log_command(now)
 
     def _publish_dshot(self, internal_values: List[int]) -> None:
+        outgoing = [int(internal_values[i]) for i in self.channel_order]
+        self.last_dshot_command = outgoing.copy()
         if self.dry_run:
             return
-        outgoing = [internal_values[i] for i in self.channel_order]
         msg = WriteDSHOT()
-        msg.channel1 = int(outgoing[0])
-        msg.channel2 = int(outgoing[1])
-        msg.channel3 = int(outgoing[2])
-        msg.channel4 = int(outgoing[3])
+        msg.channel1 = outgoing[0]
+        msg.channel2 = outgoing[1]
+        msg.channel3 = outgoing[2]
+        msg.channel4 = outgoing[3]
         self.dshot_pub.publish(msg)
 
 
@@ -277,6 +319,11 @@ def main(args=None) -> None:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except RuntimeError:
+        # ros2 launch may shut down the context before rclpy.spin() returns.
+        # Re-raise genuine runtime errors that happen while ROS is still active.
+        if rclpy.ok():
+            raise
     finally:
         # Best-effort zero command before shutdown.
         try:
@@ -284,8 +331,12 @@ def main(args=None) -> None:
             node._publish_dshot([node.dshot_disarmed] * 4)
         except Exception:
             pass
-        node.destroy_node()
-        rclpy.shutdown()
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
