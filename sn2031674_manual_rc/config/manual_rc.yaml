@@ -9,6 +9,9 @@ sn2031674_manual_rc:
     control_rate_hz: 100.0
     rc_timeout_s: 0.30
 
+    # Print the latest RC-derived DShot command in the launch terminal.
+    command_log_period_s: 1.0
+
     # Requested right-switch behavior.
     # DJI switch encoding: 1=up, 3=middle, 2=bottom.
     arm_switch_value: 3
