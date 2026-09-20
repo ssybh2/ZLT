@@ -57,7 +57,7 @@ source install/setup.bash
 
 如果报 `Package 'custom_msgs' not found` 或 `soem_wrapper` 缺失，先检查 `src/EcatV2_Master` 子模块和所依赖的 ROS 2 工作空间，不要把缺失消息类型理解为话题拼写问题。
 
-> `src/soem_bringup/launch/bringup.launch.py` 的当前默认网卡为 `enp1s0`，需先用 `ip -br link` 确认 EtherCAT 网卡名称，并按机器配置检查 `rt_cpu` 和 `non_rt_cpus`。需要调整时修改该 launch 的参数后重新构建/重新 source；不要拿正在连接互联网的网卡作为 EtherCAT 主站接口。
+> `bringup.launch.py` 默认使用网卡 `enp1s0`、实时 CPU `7`、非实时 CPU `0,1,2,3,4,5,6`。先执行 `ip -br link` 和 `nproc`，根据当前设备用启动参数覆盖这些默认值，不必修改源代码；不要拿正在连接互联网的网卡作为 EtherCAT 主站接口。
 
 ## 2. 第一个终端：启动 EtherCAT 主站
 
@@ -65,7 +65,10 @@ source install/setup.bash
 cd ~/ZLT
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 launch soem_bringup bringup.launch.py
+# 将 enp1s0 改为实际的 EtherCAT 专用网卡（用 ip -br link 查询）
+ros2 launch soem_bringup bringup.launch.py interface:=enp1s0
+# CPU 不足 8 核时，也需要根据 nproc 调整，例如：
+# ros2 launch soem_bringup bringup.launch.py interface:=enp1s0 rt_cpu:=3 non_rt_cpus:=0,1,2
 ```
 
 等待主站识别 `sn2883650`，确认 EtherCAT 从站进入预期状态、启动配置与固件 PDO 布局相符；否则先停止，不启动电机控制节点。
