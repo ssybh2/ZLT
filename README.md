@@ -28,21 +28,30 @@
   <sub>Real-flight demo</sub>
 </div>
 
-## Quick Start
+## Quick Start — `sn2031674-manual-rc-dshot` branch
+
+This branch's four-task EtherCAT example is configured for **slave `sn2883650`**, not the historical `sn2031674` in the manual RC package name. Topic mapping: app1 = DJI RC, app2 = CAN1 IMU, app3 = CAN2 IMU, app4 = DShot. The `sn2031674_manual_rc` node is **open-loop RC → DShot**, not an IMU-stabilized flight controller. Its default `dry_run:=true` publishes no DShot commands.
+
+See [sn2883650 RC → DShot launch guide](./sn2031674_manual_rc/README.md) for safety checks, ROS topics and a separate terminal per process.
 
 ```bash
-git clone --recurse-submodules https://github.com/ssybh2/ZLT.git
+git clone -b sn2031674-manual-rc-dshot --recurse-submodules \
+    https://github.com/ssybh2/ZLT.git
 cd ZLT
 
 source /opt/ros/humble/setup.bash
-colcon build --symlink-install
+colcon build --symlink-install --packages-up-to soem_bringup sn2031674_manual_rc
 source install/setup.bash
 
+# Terminal A: verify EtherCAT NIC (default: enp1s0) and configured slave first
 ros2 launch soem_bringup bringup.launch.py
-ros2 launch soft_drone_manual_controller manual_controller.launch.py dry_run:=true
+
+# Terminal B: source ROS and this workspace, then inspect the four /ecat/sn2883650/appN topics.
+# Terminal C: source ROS and this workspace; start in safe dry-run mode:
+ros2 launch sn2031674_manual_rc manual_rc.launch.py dry_run:=true
 ```
 
-> Before first motor-enabled testing, verify the EtherCAT interface, IMU directions, motor order and arming logic with propellers removed.
+> The existing `soft_drone_manual_controller` default launch still targets a **different six-IMU layout** and should not run against this four-task example without a dedicated two-IMU control configuration and validation. Never run two simultaneous publishers to the DShot command topic. For motor tests, remove propellers and verify arming, motor order and emergency power-off capability.
 
 ---
 
