@@ -1,7 +1,9 @@
 sn2031674_manual_rc:
   ros__parameters:
-    rc_topic: /ecat/sn2031674/app1/read
-    dshot_topic: /ecat/sn2031674/app4/write
+    # app1: RC; app2: CAN1 IMU; app3: CAN2 IMU; app4: DShot.
+    # The manual RC -> DShot node does not subscribe to IMUs.
+    rc_topic: /ecat/sn2883650/app1/read
+    dshot_topic: /ecat/sn2883650/app4/write
 
     # Start in dry-run. After checking RC values with props removed, launch with
     # dry_run:=false to actually publish DShot motor commands.
