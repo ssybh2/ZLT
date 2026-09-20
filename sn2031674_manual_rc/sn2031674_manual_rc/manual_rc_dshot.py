@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DJI RC -> DShot manual controller for EtherCAT slave sn2031674.
+"""DJI RC -> DShot manual controller for EtherCAT slave sn2883650.
 
 The RC channel semantics intentionally match ZLT:
   throttle = left_y
@@ -37,8 +37,8 @@ class ManualRcDshot(Node):
     def __init__(self) -> None:
         super().__init__("sn2031674_manual_rc")
 
-        self.declare_parameter("rc_topic", "/ecat/sn2031674/app1/read")
-        self.declare_parameter("dshot_topic", "/ecat/sn2031674/app4/write")
+        self.declare_parameter("rc_topic", "/ecat/sn2883650/app1/read")
+        self.declare_parameter("dshot_topic", "/ecat/sn2883650/app4/write")
         self.declare_parameter("dry_run", True)
         self.declare_parameter("control_rate_hz", 100.0)
         self.declare_parameter("rc_timeout_s", 0.30)
